@@ -99,20 +99,108 @@ body {
   flex-direction: column;
 }
 
+/* --- 主布局 --- */
 .app-layout {
+  display: grid;
+  grid-template-columns: 280px 1fr 360px;
+  grid-template-rows: 1fr;
+  gap: 1px;
+  background: var(--border-primary);
   flex: 1;
   overflow: hidden;
+  height: calc(100vh - 60px);
+  transition: grid-template-columns 0.25s ease;
 }
 
-.chatbar {
-  position: sticky;
-  bottom: 0;
-  width: 100%;
+.app-layout--collapsed {
+  grid-template-columns: 280px 1fr 52px;
+}
+
+/* 中栏包裹对话流+输入 */
+.panel--center {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
   background: var(--bg-secondary);
+}
+
+/* 输入框内联在中栏底部 */
+.chatbar-inline {
+  flex-shrink: 0;
   border-top: 1px solid var(--border-primary);
-  padding: 10px var(--space-xl);
-  box-shadow: 0 -6px 12px rgba(0, 0, 0, 0.25);
-  z-index: 10;
+  padding: 10px var(--space-lg);
+  background: var(--bg-tertiary);
+}
+
+/* --- 右栏折叠控件 --- */
+.sidebar-toggle {
+  position: absolute;
+  left: -14px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  font-size: 0.65rem;
+  cursor: pointer;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+
+.sidebar-toggle:hover {
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+  background: var(--bg-tertiary);
+}
+
+.sidebar-panel {
+  position: relative;
+  transition: width 0.25s ease;
+}
+
+.sidebar-panel--collapsed {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 40px;
+}
+
+.sidebar-icons {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 0;
+}
+
+.sidebar-icon-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+
+.sidebar-icon-btn:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--border-primary);
+}
+
+.sidebar-icon-btn--active {
+  background: rgba(59, 130, 246, 0.1);
+  border-color: rgba(59, 130, 246, 0.3);
 }
 
 /* --- 滚动条 --- */
@@ -453,18 +541,6 @@ body {
     transform: scale(1.5);
     opacity: 0.5;
   }
-}
-
-/* --- 主布局 --- */
-.app-layout {
-  display: grid;
-  grid-template-columns: 320px 1fr 360px;
-  grid-template-rows: 1fr;
-  gap: 1px;
-  background: var(--border-primary);
-  flex: 1;
-  overflow: hidden;
-  height: calc(100vh - 60px);
 }
 
 /* --- 面板通用样式 --- */

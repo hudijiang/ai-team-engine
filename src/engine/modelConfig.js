@@ -14,14 +14,6 @@ const MODELS_CACHE_KEY = 'agent-auto-models-cache';
  */
 export const PROVIDERS = [
     {
-        id: 'gptge',
-        name: 'GPT.GE (OpenAI 兼容代理)',
-        icon: '⭐',
-        defaultApiUrl: 'https://api.gpt.ge/v1',
-        modelsPath: '/models',
-        placeholder: 'sk-...',
-    },
-    {
         id: 'openai',
         name: 'OpenAI',
         icon: '🟢',
