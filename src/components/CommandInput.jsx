@@ -36,8 +36,18 @@ export default function CommandInput() {
 
     const handleSubmit = useCallback(() => {
         const objective = input.trim();
-        // 允许在 completed / blocked 时继续发指令；只在正在运行或等待配置/人工时禁用
+        // 只在正在运行或等待配置/人工时禁用
         if (!objective || isRunning || isWaitingConfig || isWaitingHuman) return;
+
+        // 如果当前已完成或有残留状态，先归档当前会话再开新会话
+        if (isCompleted || isBlocked) {
+            dispatch({ type: 'RESET' });
+            // 清理旧 runner
+            if (runnerRef.current) {
+                runnerRef.current.stop();
+                runnerRef.current = null;
+            }
+        }
 
         // 设置目标
         dispatch({ type: 'SET_OBJECTIVE', payload: objective });
@@ -56,13 +66,13 @@ export default function CommandInput() {
             },
         });
 
-        // 启动 CEO Agent
+        // 启动新的 CEO Agent
         const runner = new CEOAgentRunner(dispatch, getSnapshot);
         runnerRef.current = runner;
         runner.start(objective);
 
         setInput('');
-    }, [input, isRunning, isWaitingConfig, isWaitingHuman, isBlocked, dispatch, getSnapshot]);
+    }, [input, isRunning, isCompleted, isBlocked, isWaitingConfig, isWaitingHuman, dispatch, getSnapshot]);
 
     /**
      * 董事长确认模型配置，恢复 CEO 执行
