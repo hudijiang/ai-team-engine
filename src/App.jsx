@@ -12,7 +12,7 @@ import { useStore } from './store/store';
 
 /**
  * 主应用组件
- * 三栏布局：组织架构 | 对话流(含输入) | 状态面板(可折叠)
+ * 三栏布局：组织架构(可折叠) | 对话流+输入 | 状态面板(可折叠)
  */
 export default function App() {
     useInboxSubscriber();
@@ -20,6 +20,7 @@ export default function App() {
     const agents = useStore(s => s.agents);
     const [rightTab, setRightTab] = useState('progress');
     const [rightCollapsed, setRightCollapsed] = useState(false);
+    const [leftCollapsed, setLeftCollapsed] = useState(false);
 
     const statusText = {
         idle: '待命中',
@@ -37,6 +38,12 @@ export default function App() {
         { key: 'deliverables', icon: '📄', label: '报告' },
         { key: 'config', icon: '⚙️', label: '配置' },
     ];
+
+    const layoutClasses = [
+        'app-layout',
+        rightCollapsed ? 'app-layout--collapsed' : '',
+        leftCollapsed ? 'app-layout--left-collapsed' : '',
+    ].filter(Boolean).join(' ');
 
     return (
         <>
@@ -61,20 +68,52 @@ export default function App() {
             </header>
 
             {/* 主布局 */}
-            <div className={`app-layout ${rightCollapsed ? 'app-layout--collapsed' : ''}`}>
-                {/* 左栏：组织架构 */}
-                <div className="panel panel--left">
-                    <div className="panel__header">
-                        <span className="panel__title">🏗️ 组织架构</span>
-                        <span className="text-sm text-muted">{agents.length} 人</span>
-                    </div>
-                    <div className="panel__content">
-                        <OrgChart />
-                    </div>
+            <div className={layoutClasses}>
+                {/* 左栏：组织架构（可折叠） */}
+                <div className={`panel panel--left ${leftCollapsed ? 'panel--left-collapsed' : ''}`}>
+                    <button
+                        className="left-toggle"
+                        onClick={() => setLeftCollapsed(!leftCollapsed)}
+                        title={leftCollapsed ? '展开组织架构' : '折叠组织架构'}
+                    >
+                        {leftCollapsed ? '▶' : '◀'}
+                    </button>
+
+                    {leftCollapsed ? (
+                        /* 折叠态：只显示 Agent 头像竖排 */
+                        <div className="left-collapsed-content">
+                            {agents.map(a => (
+                                <button
+                                    key={a.id}
+                                    className="left-icon-btn"
+                                    title={`${a.name} — ${a.currentTask || '空闲'}`}
+                                    onClick={() => setLeftCollapsed(false)}
+                                >
+                                    <div
+                                        className="left-icon-btn__avatar"
+                                        style={{ background: a.color || '#3B82F6' }}
+                                    >
+                                        {a.name === 'CEO' ? '🎯' : a.name.charAt(0)}
+                                    </div>
+                                </button>
+                            ))}
+                        </div>
+                    ) : (
+                        /* 展开态：完整的组织架构 */
+                        <>
+                            <div className="panel__header">
+                                <span className="panel__title">🏗️ 组织架构</span>
+                                <span className="text-sm text-muted">{agents.length} 人</span>
+                            </div>
+                            <div className="panel__content">
+                                <OrgChart />
+                            </div>
+                        </>
+                    )}
                 </div>
 
                 {/* 中栏：对话流 + 底部输入 */}
-                <div className="panel panel--center">
+                <div className="panel--center">
                     <DialoguePanel />
                     <div className="chatbar-inline">
                         <CommandInput />
@@ -83,7 +122,6 @@ export default function App() {
 
                 {/* 右栏：状态面板（可折叠） */}
                 <div className={`panel sidebar-panel ${rightCollapsed ? 'sidebar-panel--collapsed' : ''}`}>
-                    {/* 折叠切换按钮 */}
                     <button
                         className="sidebar-toggle"
                         onClick={() => setRightCollapsed(!rightCollapsed)}
@@ -93,7 +131,6 @@ export default function App() {
                     </button>
 
                     {rightCollapsed ? (
-                        /* 折叠态：仅显示 icon 竖排 */
                         <div className="sidebar-icons">
                             {tabs.map(t => (
                                 <button
@@ -107,7 +144,6 @@ export default function App() {
                             ))}
                         </div>
                     ) : (
-                        /* 展开态：tab 栏 + 内容 */
                         <>
                             <div className="panel-tabs">
                                 {tabs.map(t => (
