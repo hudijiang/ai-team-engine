@@ -39,17 +39,13 @@ export default function CommandInput() {
         // 只在正在运行或等待配置/人工时禁用
         if (!objective || isRunning || isWaitingConfig || isWaitingHuman) return;
 
-        // 如果当前已完成或有残留状态，先归档当前会话再开新会话
-        if (isCompleted || isBlocked) {
-            dispatch({ type: 'RESET' });
-            // 清理旧 runner
-            if (runnerRef.current) {
-                runnerRef.current.stop();
-                runnerRef.current = null;
-            }
+        // 清理旧 runner（但不 RESET 会话，延续当前对话上下文）
+        if (runnerRef.current) {
+            runnerRef.current.stop();
+            runnerRef.current = null;
         }
 
-        // 设置目标
+        // 更新当前目标（不归档，延续同一会话）
         dispatch({ type: 'SET_OBJECTIVE', payload: objective });
         dispatch({
             type: 'ADD_MESSAGE',
@@ -66,7 +62,7 @@ export default function CommandInput() {
             },
         });
 
-        // 启动新的 CEO Agent
+        // 启动新的 CEO Agent（复用已有团队成员）
         const runner = new CEOAgentRunner(dispatch, getSnapshot);
         runnerRef.current = runner;
         runner.start(objective);
