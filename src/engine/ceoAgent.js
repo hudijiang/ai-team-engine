@@ -9,7 +9,7 @@ import {
     DIALOGUE_TEMPLATES,
     AI_MODELS,
 } from './agentEngine';
-import { decomposeObjective } from './taskDecomposer';
+import { decomposeWithLLM } from './taskDecomposer';
 import messageBus from './messageBus';
 import { sendChat, resolveProviderForModel } from './llmClient';
 import { loadProviderConfigs } from './modelConfig';
@@ -98,22 +98,40 @@ export class CEOAgentRunner {
             payload: {
                 id: ceoAgent.id,
                 state: AGENT_STATES.PLANNING,
-                currentTask: `分析战略目标：${objective}`,
+                currentTask: `正在调用 AI 分析目标：${objective}`,
                 progress: 0.05,
             },
         });
 
         this._emitCEOMessage(ceoAgent, [
             `【CEO】收到董事长战略目标：「${objective}」`,
-            `正在深度分析目标，制定执行策略...`,
-        ], ['分析目标可行性', '拆解为可执行任务', '创建执行团队']);
+            `正在调用 AI 深度分析目标，智能组建执行团队...`,
+        ], ['调用 AI 分析目标', '智能拆解任务', '动态组建团队']);
 
-        await this._delay(2000);
-        if (this._aborted) return;
+        // 阶段 2：使用 LLM 拆解任务
+        let decomposition;
+        try {
+            const latestCEO = this._getLatestAgent(ceoAgent.id) || ceoAgent;
+            const ceoModel = latestCEO.model || state.defaultModel || '';
+            const availableModels = state.availableModels || {};
 
-        // 阶段 2：拆解任务
-        const decomposition = decomposeObjective(objective);
-        logger.info('CEO', `目标拆解完成：类型=${decomposition.type}，阶段=${decomposition.totalPhases}，角色=${decomposition.roles.map(r => r.name).join(',')}`);
+            if (!ceoModel) {
+                throw new Error('CEO 未配置模型，无法调用 AI 分析');
+            }
+
+            decomposition = await decomposeWithLLM(objective, ceoModel, availableModels);
+        } catch (err) {
+            logger.error('CEO', `LLM 目标分析失败: ${err.message}`);
+            this._emitCEOMessage(ceoAgent, [
+                `【CEO】⚠️ AI 分析目标失败：${err.message}`,
+                `请检查 CEO 的模型配置和 API Key 是否正确，然后重新发布目标。`,
+            ], []);
+            this.dispatch({ type: 'SET_STATUS', payload: 'blocked' });
+            this.isRunning = false;
+            return;
+        }
+
+        logger.info('CEO', `AI 目标拆解完成：类型=${decomposition.type}，阶段=${decomposition.totalPhases}，角色=${decomposition.roles.map(r => r.name).join(',')}`);
         this.dispatch({
             type: 'SET_DECOMPOSITION',
             payload: decomposition,
@@ -124,14 +142,14 @@ export class CEOAgentRunner {
             payload: {
                 id: ceoAgent.id,
                 progress: 0.15,
-                currentTask: '任务拆解与角色分配',
+                currentTask: 'AI 分析完成，组建团队',
             },
         });
 
         this._emitCEOMessage(ceoAgent, [
-            `【CEO】目标分析完毕，识别为「${decomposition.type}」类型项目。`,
+            `【CEO】🧠 AI 分析完毕，识别为「${decomposition.type}」类型项目。`,
             `将拆解为 ${decomposition.totalPhases} 个执行阶段，预计需要 ${decomposition.estimatedDuration} 个工作周期。`,
-            `需要组建以下角色团队：`,
+            `AI 智能组建以下角色团队：`,
             ...decomposition.roles.map(r => `  • ${r.name}：${r.role}`),
         ], ['创建团队成员', '分配具体任务', '启动执行流程']);
 
