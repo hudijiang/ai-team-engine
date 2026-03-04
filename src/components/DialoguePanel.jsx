@@ -205,9 +205,7 @@ export default function DialoguePanel() {
                         const msgColor = agentColorMap[msg.agentId] || '#3B82F6';
                         const stateColor = STATE_COLORS[msg.state] || msgColor;
                         const showJson = expandedJson.has(idx);
-                        // 智能展开：有 outputContent 的消息默认展开，其他默认收起
-                        const hasOutput = !!msg.outputContent;
-                        const showDetails = expandedDetails.has(idx) ? !hasOutput : hasOutput;
+                        const showDetails = !expandedDetails.has(idx); // 默认展开，点击收起
 
                         // 构建符合要求的结构化 JSON
                         const structuredJson = {
