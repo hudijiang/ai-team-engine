@@ -443,46 +443,48 @@ export class CEOAgentRunner {
         this.dispatch({ type: 'ADD_DELIVERABLE', payload: deliverable });
 
         // CEO 汇报附带各阶段成果摘要
-        const state3 = this.getState();
-        const outputSummaryLines = [];
-        tasks.forEach(t => {
-            const agentState = state3.agents.find(a => a.name === t.assignee);
-            const outputs = agentState?.outputs || [];
-            if (outputs.length > 0) {
-                outputSummaryLines.push(`📌 ${t.phase}（${t.assignee}）：`);
-                outputs.forEach(o => {
-                    const firstLine = (o.content || '').split('\n').find(l => l.trim()) || '';
-                    outputSummaryLines.push(`  • ${o.subtask} — ${firstLine.replace(/^#+\s*/, '').slice(0, 80)}`);
-                });
-            }
-        });
+        try {
+            const state3 = this.getState();
+            const outputSummaryLines = [];
+            tasks.forEach(t => {
+                const agentState = state3.agents.find(a => a.name === t.assignee);
+                const outputs = agentState?.outputs || [];
+                if (outputs.length > 0) {
+                    outputSummaryLines.push(`📌 ${t.phase}（${t.assignee}）：`);
+                    outputs.forEach(o => {
+                        const firstLine = (o.content || '').split('\n').find(l => l.trim()) || '';
+                        outputSummaryLines.push(`  • ${o.subtask} — ${firstLine.replace(/^#+\s*/, '').slice(0, 80)}`);
+                    });
+                }
+            });
 
-        const reportLines = [
-            `【CEO】📋 向董事长汇报：`,
-            `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
-            `战略目标：「${decomposition.objective}」`,
-            `项目类型：${decomposition.type}`,
-            `执行阶段：${tasks.length} 个阶段全部完成`,
-            `团队成员：${teamAgents.length} 人`,
-            `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
-            ``,
-            `### 成果概要`,
-            ...outputSummaryLines,
-            ``,
-            `🎉 项目已圆满完成！详细报告已生成，请查看下方「交付物」面板。`,
-        ];
+            const reportLines = [
+                `【CEO】📋 向董事长汇报：`,
+                `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+                `战略目标：「${decomposition.objective}」`,
+                `项目类型：${decomposition.type}`,
+                `执行阶段：${tasks.length} 个阶段全部完成`,
+                `团队成员：${teamAgents.length} 人`,
+                `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+                ``,
+                `### 成果概要`,
+                ...outputSummaryLines,
+                ``,
+                `🎉 项目已圆满完成！详细报告已生成，请查看下方「交付物」面板。`,
+            ];
 
-        // 使用特殊消息携带完整交付报告
-        const msg = createStructuredMessage({
-            agent: ceoAgent,
-            state: AGENT_STATES.COMPLETED,
-            task: '项目完成',
-            progress: 1,
-            dialogue: reportLines,
-            nextSteps: [],
-        });
-        msg.outputContent = deliverable.content;
-        this.dispatch({ type: 'ADD_MESSAGE', payload: { ...msg, agentId: ceoAgent.id, timestamp: new Date().toISOString() } });
+            // 使用正确的位置参数调用 createStructuredMessage(agent, dialogue, nextStep, outputContent)
+            const latestCEO = this._getLatestAgent(ceoAgent.id) || ceoAgent;
+            const msg = createStructuredMessage(latestCEO, reportLines, [], deliverable.content);
+            this.dispatch({ type: 'ADD_MESSAGE', payload: { ...msg, agentId: ceoAgent.id, timestamp: new Date().toISOString() } });
+        } catch (err) {
+            logger.error('CEO', `生成完成报告异常: ${err.message}`);
+            // 即使报告生成失败，也要保证 completed 状态能设置
+            this._emitCEOMessage(ceoAgent, [
+                `【CEO】📋 项目已完成！交付物已生成。`,
+                `🎉 所有 ${tasks.length} 个阶段执行完毕。`,
+            ], []);
+        }
 
         this.dispatch({ type: 'SET_STATUS', payload: 'completed' });
         logger.info('CEO', `项目完成：「${decomposition.objective}」，共 ${tasks.length} 阶段`);
