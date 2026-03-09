@@ -215,6 +215,17 @@ function agentReducer(state, action) {
         case 'CLEAR_HISTORY': {
             return { ...state, sessionHistory: [] };
         }
+
+        case 'ADD_PROMPT_LOG': {
+            // 保留最近 200 条
+            const logs = [...state.promptLogs, action.payload].slice(-200);
+            return { ...state, promptLogs: logs };
+        }
+
+        case 'CLEAR_PROMPT_LOGS': {
+            return { ...state, promptLogs: [] };
+        }
+
         default:
             return state;
     }
@@ -238,6 +249,7 @@ function pickPersistable(state) {
         systemLog: state.systemLog,
         selectedAgentId: state.selectedAgentId,
         availableModels: state.availableModels,
+        promptLogs: (state.promptLogs || []).slice(-50),
     };
 }
 
@@ -277,13 +289,14 @@ function getInitialState() {
         deliverables: [],
         pendingDecision: null,
         currentObjective: '',
-        currentSessionId: null,        // 当前会话 ID
-        sessionHistory: [],            // 历史会话归档 [{sessionId, objective, timestamp, messages}]
+        currentSessionId: null,
+        sessionHistory: [],
         systemStatus: 'idle',
         decomposition: null,
         systemLog: [],
         selectedAgentId: null,
         availableModels: {},
+        promptLogs: [],
     };
 }
 

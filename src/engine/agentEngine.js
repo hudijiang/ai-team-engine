@@ -44,26 +44,6 @@ export const STATE_COLORS = {
     completed: '#10B981',
 };
 
-/**
- * 可选 AI 模型列表（用户可自行选择分配给每个 Agent）
- */
-export const AI_MODELS = [
-    { id: 'gpt-5.3', name: 'GPT-5.3', provider: 'OpenAI', icon: '🟢' },
-    { id: 'gpt-5.3-mini', name: 'GPT-5.3 Mini', provider: 'OpenAI', icon: '🟢' },
-    { id: 'gpt-4o', name: 'GPT-4o', provider: 'OpenAI', icon: '🟢' },
-    { id: 'claude-4.6-sonnet', name: 'Claude 4.6 Sonnet', provider: 'Anthropic', icon: '🟠' },
-    { id: 'claude-ops-4.6-thinking', name: 'Claude Opus 4.6 Thinking', provider: 'Anthropic', icon: '🟠' },
-    { id: 'gemini-2.0-pro', name: 'Gemini 2.0 Pro', provider: 'Google', icon: '🔵' },
-    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', provider: 'Google', icon: '🔵' },
-    { id: 'deepseek-v3', name: 'DeepSeek V3', provider: 'DeepSeek', icon: '🟣' },
-    { id: 'deepseek-r1', name: 'DeepSeek R1', provider: 'DeepSeek', icon: '🟣' },
-    { id: 'qwen-max', name: 'Qwen Max', provider: 'Alibaba', icon: '🔴' },
-    { id: 'minimax-01', name: 'MiniMax-01', provider: 'MiniMax', icon: '🟡' },
-    { id: 'minimax-text-01', name: 'MiniMax-Text-01', provider: 'MiniMax', icon: '🟡' },
-    { id: 'glm-4-plus', name: 'GLM-4-Plus', provider: '智谱AI', icon: '🔶' },
-    { id: 'glm-4-flash', name: 'GLM-4-Flash', provider: '智谱AI', icon: '🔶' },
-];
-
 /** 默认模型（空表示由用户自选） */
 export const DEFAULT_MODEL = '';
 
@@ -162,6 +142,5 @@ export default {
     STATE_LABELS,
     STATE_COLORS,
     DIALOGUE_TEMPLATES,
-    AI_MODELS,
     DEFAULT_MODEL,
 };

@@ -1,6 +1,6 @@
 import React from 'react';
 import { useStore } from '../store/store';
-import { STATE_LABELS, STATE_COLORS, AI_MODELS } from '../engine/agentEngine';
+import { STATE_LABELS, STATE_COLORS } from '../engine/agentEngine';
 
 /**
  * Agent 卡片组件
@@ -20,9 +20,9 @@ export default function AgentCard({ agent }) {
     // 允许在 waiting/planning 状态切换模型
     const isRunning = ['executing', 'reviewing'].includes(agent.state);
 
-    // 合并所有供应商的模型列表 + 内置静态列表作为备选
+    // 合并所有供应商的动态模型列表
     const dynamicModels = Object.values(availableModels || {}).flat();
-    const allModelOptions = dynamicModels.length > 0 ? dynamicModels : AI_MODELS;
+    const hasModels = dynamicModels.length > 0;
 
     // 获取角色首字
     const avatarText = isCEO ? '🎯' : agent.name.charAt(0);
@@ -82,8 +82,8 @@ export default function AgentCard({ agent }) {
                     id={`model-select-${agent.id}`}
                 >
                     <option value="">-- 选择模型 --</option>
-                    {dynamicModels.length > 0 ? (
-                        // 按供应商分组显示 API 获取的模型
+                    {hasModels ? (
+                        // 按供应商分组显示 API 动态获取的模型
                         Object.entries(availableModels || {}).map(([providerId, models]) => (
                             <optgroup key={providerId} label={providerId.toUpperCase()}>
                                 {models.map(m => (
@@ -92,10 +92,8 @@ export default function AgentCard({ agent }) {
                             </optgroup>
                         ))
                     ) : (
-                        // 回退到内置静态列表
-                        AI_MODELS.map(m => (
-                            <option key={m.id} value={m.id}>{m.icon} {m.name}</option>
-                        ))
+                        // 未配置任何 API Provider，引导用户
+                        <option value="" disabled>请先在设置中配置 API Key</option>
                     )}
                 </select>
             </div>

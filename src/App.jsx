@@ -6,6 +6,11 @@ import SystemLog from './components/SystemLog';
 import ModelConfigPanel from './components/ModelConfigPanel';
 import CollaborationInbox from './components/CollaborationInbox';
 import DeliverablesPanel from './components/DeliverablesPanel';
+import PromptInspector from './components/PromptInspector';
+import CostDashboard from './components/CostDashboard';
+import TimelinePlayer from './components/TimelinePlayer';
+import KnowledgePanel from './components/KnowledgePanel';
+import PluginPanel from './components/PluginPanel';
 import useInboxSubscriber from './hooks/useInboxSubscriber';
 import CommandInput from './components/CommandInput';
 import { useStore } from './store/store';
@@ -34,14 +39,20 @@ export default function App() {
         completed: '已完成',
         waiting_for_config: '⏸ 待配置',
         waiting_for_human: '🚨 待协助',
+        paused: '⏸️ 已暂停',
         blocked: '⚠️ 阻塞',
     };
 
     const rightTabs = [
         { key: 'progress', icon: '📊', label: '进度' },
+        { key: 'cost', icon: '💰', label: '成本' },
+        { key: 'timeline', icon: '⏱️', label: '回放' },
         { key: 'log', icon: '📜', label: '日志' },
         { key: 'inbox', icon: '📨', label: '协作' },
         { key: 'deliverables', icon: '📄', label: '报告' },
+        { key: 'knowledge', icon: '📚', label: '知识库' },
+        { key: 'plugins', icon: '🧩', label: '插件' },
+        { key: 'debug', icon: '🔍', label: '调试' },
         { key: 'config', icon: '⚙️', label: '配置' },
     ];
 
@@ -252,9 +263,14 @@ export default function App() {
                             </div>
                             <div className="panel__content">
                                 {rightTab === 'progress' && <ProgressDashboard />}
+                                {rightTab === 'cost' && <CostDashboard />}
+                                {rightTab === 'timeline' && <TimelinePlayer />}
                                 {rightTab === 'log' && <SystemLog />}
                                 {rightTab === 'inbox' && <CollaborationInbox />}
                                 {rightTab === 'deliverables' && <DeliverablesPanel />}
+                                {rightTab === 'knowledge' && <KnowledgePanel />}
+                                {rightTab === 'plugins' && <PluginPanel />}
+                                {rightTab === 'debug' && <PromptInspector />}
                                 {rightTab === 'config' && <ModelConfigPanel />}
                             </div>
                         </>

@@ -261,6 +261,19 @@ export default function DialoguePanel() {
                                     {msg.dialogue && msg.dialogue.map((line, i) => (
                                         <p key={i}>{line}</p>
                                     ))}
+                                    {/* 多模态：图片渲染 */}
+                                    {msg.imageUrl && (
+                                        <div style={{ marginTop: '8px' }}>
+                                            <img
+                                                src={msg.imageUrl}
+                                                alt="Agent 产出图片"
+                                                style={{
+                                                    maxWidth: '100%', borderRadius: '8px',
+                                                    border: '1px solid var(--border-primary)',
+                                                }}
+                                            />
+                                        </div>
+                                    )}
                                 </div>
 
                                 {/* 结构化 JSON 展示 */}

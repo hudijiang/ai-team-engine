@@ -31,13 +31,13 @@ export default function CommandInput() {
     const isWaitingHuman = systemStatus === 'waiting_for_human';
     const isBlocked = systemStatus === 'blocked';
     const isWaitingDecision = systemStatus === 'waiting_for_decision';
+    const isPaused = systemStatus === 'paused';
 
     const [humanInput, setHumanInput] = useState('');
 
     const handleSubmit = useCallback(() => {
         const objective = input.trim();
-        // 只在正在运行或等待配置/人工时禁用
-        if (!objective || isRunning || isWaitingConfig || isWaitingHuman) return;
+        if (!objective || isRunning || isWaitingConfig || isWaitingHuman || isPaused) return;
 
         // 清理旧 runner（但不 RESET 会话，延续当前对话上下文）
         if (runnerRef.current) {
@@ -97,6 +97,20 @@ export default function CommandInput() {
         setInput('');
         setHumanInput('');
     }, [reset]);
+
+    /** 暂停执行 */
+    const handlePause = useCallback(() => {
+        if (runnerRef.current) {
+            runnerRef.current.pause();
+        }
+    }, []);
+
+    /** 恢复执行 */
+    const handleUnpause = useCallback(() => {
+        if (runnerRef.current) {
+            runnerRef.current.unpause();
+        }
+    }, []);
 
     const handleKeyDown = (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
@@ -198,6 +212,29 @@ export default function CommandInput() {
                 </div>
             )}
 
+            {/* 暂停状态提示 */}
+            {isPaused && (
+                <div className="command-input__config-notice" style={{ borderColor: 'rgba(139,92,246,0.4)' }}>
+                    <div className="command-input__config-text" style={{ color: 'var(--accent-purple)' }}>
+                        ⏸️ 执行已暂停。您可以调整团队配置，然后恢复执行。
+                    </div>
+                    <div className="command-input__config-actions">
+                        <button
+                            className="command-input__start-btn"
+                            onClick={handleUnpause}
+                        >
+                            ▶️ 恢复执行
+                        </button>
+                        <button
+                            className="command-input__reset"
+                            onClick={handleReset}
+                        >
+                            重置
+                        </button>
+                    </div>
+                </div>
+            )}
+
             {/* 等待董事长决策状态 */}
             {isWaitingDecision && (
                 <DecisionPanel
@@ -210,7 +247,7 @@ export default function CommandInput() {
             )}
 
             {/* 正常输入状态 */}
-            {!isWaitingConfig && !isWaitingHuman && !isWaitingDecision && (
+            {!isWaitingConfig && !isWaitingHuman && !isWaitingDecision && !isPaused && (
                 <>
                     <div className="command-input__wrapper">
                         <input
@@ -232,13 +269,24 @@ export default function CommandInput() {
                             {isRunning ? '执行中...' : '发布'}
                         </button>
                         {(isRunning || isCompleted) && (
-                            <button
-                                className="command-input__reset"
-                                onClick={handleReset}
-                                id="reset-btn-2"
-                            >
-                                重置
-                            </button>
+                            <>
+                                {isRunning && (
+                                    <button
+                                        className="command-input__reset"
+                                        onClick={handlePause}
+                                        style={{ background: 'rgba(139,92,246,0.15)', borderColor: 'rgba(139,92,246,0.3)', color: 'var(--accent-purple)' }}
+                                    >
+                                        ⏸️ 暂停
+                                    </button>
+                                )}
+                                <button
+                                    className="command-input__reset"
+                                    onClick={handleReset}
+                                    id="reset-btn-2"
+                                >
+                                    重置
+                                </button>
+                            </>
                         )}
                     </div>
                     {!isRunning && !isCompleted && (

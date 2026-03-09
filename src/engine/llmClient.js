@@ -4,6 +4,7 @@
  * 仅在浏览器侧发起 fetch；不在服务端存储任何密钥。
  */
 import { loadProviderConfigs, PROVIDERS } from './modelConfig';
+import tokenTracker from './tokenTracker';
 import logger from '../utils/logger';
 
 // 简单节流：按 provider 限制 ~3 rps
@@ -103,7 +104,8 @@ export function resolveProviderForModel(modelId, availableModels = {}) {
  * @param {(token:string)=>void} [params.onToken] - 流式回调
  * @returns {Promise<string>} LLM 回复内容
  */
-export async function sendChat({ model, messages, availableModels, stream = false, onToken }) {
+export async function sendChat({ model, messages, availableModels, stream = false, onToken, agentName = '', dispatch = null }) {
+    const startTime = Date.now();
     const configs = loadProviderConfigs();
     const providerId = resolveProviderForModel(model, availableModels);
     await throttle(providerId);
@@ -164,11 +166,24 @@ export async function sendChat({ model, messages, availableModels, stream = fals
         }
 
         // 流式模式下 body 已被消费，直接返回累积内容
+        const durationMs = Date.now() - startTime;
+        const inputText = messages.map(m => m.content).join('\n');
+        const logEntry = tokenTracker.record({ model, provider: providerId, agentName, inputText, outputText: fullContent, durationMs });
+        if (dispatch) {
+            dispatch({ type: 'ADD_PROMPT_LOG', payload: { ...logEntry, inputText, outputText: fullContent } });
+        }
         return fullContent;
     }
 
     const data = await res.json();
-    return adapter.parse(data) || '';
+    const result = adapter.parse(data) || '';
+    const durationMs = Date.now() - startTime;
+    const inputText = messages.map(m => m.content).join('\n');
+    const logEntry = tokenTracker.record({ model, provider: providerId, agentName, inputText, outputText: result, durationMs });
+    if (dispatch) {
+        dispatch({ type: 'ADD_PROMPT_LOG', payload: { ...logEntry, inputText, outputText: result } });
+    }
+    return result;
 }
 
 export default { sendChat, resolveProviderForModel };

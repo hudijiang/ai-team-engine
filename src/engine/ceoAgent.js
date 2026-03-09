@@ -7,13 +7,13 @@ import {
     createStructuredMessage,
     AGENT_STATES,
     DIALOGUE_TEMPLATES,
-    AI_MODELS,
 } from './agentEngine';
 import { decomposeWithLLM } from './taskDecomposer';
 import messageBus from './messageBus';
 import { sendChat, resolveProviderForModel } from './llmClient';
-import { loadProviderConfigs } from './modelConfig';
+import { loadProviderConfigs, PROVIDERS, fetchModelsFromAPI, getCachedModels } from './modelConfig';
 import { v4 as uuidv4 } from 'uuid';
+import { formatMemoryContext, saveMemory } from './agentMemory';
 import logger from '../utils/logger';
 
 /**
@@ -31,15 +31,17 @@ export class CEOAgentRunner {
         this.timers = [];
         this.isRunning = false;
         this._aborted = false;
+        this._paused = false;
         this._pendingHumanInput = null;
         this._pendingExecution = null;
+        this._pauseResolve = null;
     }
 
     /**
-     * 智能推荐模型
-     * 根据角色职责自动匹配最合适的可用模型
+     * 智能推荐模型（LLM 动态驱动）
+     * 根据角色职责，调用 LLM 从可用模型中推荐最合适的模型
      */
-    _autoRecommendModel(roleName) {
+    async _autoRecommendModel(roleName) {
         const state = this.getState();
         const availableModelsDict = state.availableModels || {};
 
@@ -49,30 +51,115 @@ export class CEOAgentRunner {
             allModels = allModels.concat(models);
         }
 
-        if (allModels.length === 0) {
-            // fallback 到内置静态模型列表
-            allModels = AI_MODELS;
-        }
-
         if (allModels.length === 0) return '';
 
-        const lowerRole = roleName.toLowerCase();
-        let recommended = null;
-
-        // 1. 编程代码类 -> Sonnet 3.5 / GPT-4o / DeepSeek V3/R1
-        if (['前端', '后端', '架构', '测试', '开发', '工程师', '代码'].some(k => lowerRole.includes(k))) {
-            recommended = allModels.find(m => m.id.includes('sonnet') || m.id.includes('claude-3.5') || m.id.includes('gpt-4') || m.id.includes('deepseek'));
-        }
-        // 2. 创意内容/文案类 -> Opus / GPT-4o
-        else if (['文案', '内容', '策划', '报告', '设计师', '创意'].some(k => lowerRole.includes(k))) {
-            recommended = allModels.find(m => m.id.includes('opus') || m.id.includes('gpt-4'));
-        }
-        // 3. 数据分析/逻辑推理 -> DeepSeek R1 / o1 / Opus
-        else if (['分析', '数据', '研究', '财务'].some(k => lowerRole.includes(k))) {
-            recommended = allModels.find(m => m.id.includes('r1') || m.id.includes('o1') || m.id.includes('gpt-5') || m.id.includes('deepseek'));
+        // 尝试 LLM 推荐
+        try {
+            const recommended = await this._llmRecommendModel(roleName, allModels);
+            if (recommended) return recommended;
+        } catch (e) {
+            logger.warn('CEO', `LLM 模型推荐失败(${roleName}): ${e.message}，使用 fallback`);
         }
 
-        return recommended ? recommended.id : allModels[0].id;
+        // fallback：返回第一个可用模型
+        return allModels[0].id;
+    }
+
+    /**
+     * 调用 LLM 为角色推荐最佳模型
+     * @param {string} roleName - 角色名称
+     * @param {Array} allModels - 所有可用模型列表
+     * @returns {Promise<string|null>} 推荐的模型 ID
+     */
+    async _llmRecommendModel(roleName, allModels) {
+        const state = this.getState();
+        const ceoAgent = state.agents.find(a => a.name === 'CEO');
+        const ceoModel = ceoAgent?.model || state.defaultModel || '';
+        if (!ceoModel) return null;
+
+        const modelList = allModels.map(m => `- ${m.id}（${m.provider || '未知供应商'}）`).join('\n');
+
+        const prompt = `你是项目 CEO，需要为团队成员推荐最合适的 AI 模型。
+
+角色名称：「${roleName}」
+
+可用模型列表：
+${modelList}
+
+请根据角色的工作性质（如编程需要代码能力强的模型，创意文案需要生成能力强的模型，数据分析需要推理能力强的模型），从以上可用模型中选择最合适的一个。
+
+只返回模型 ID，不要返回其他任何文字。`;
+
+        const result = await this._callLLMWithRetry({
+            model: ceoModel,
+            messages: [{ role: 'user', content: prompt }],
+            availableModels: state.availableModels,
+        });
+
+        const modelId = (result || '').trim();
+        // 验证返回的模型 ID 确实在可用列表中
+        const matched = allModels.find(m => m.id === modelId);
+        if (matched) {
+            logger.info('CEO', `LLM 为「${roleName}」推荐模型：${modelId}`);
+            return matched.id;
+        }
+
+        // 模糊匹配：LLM 可能返回的格式与列表略有不同
+        const fuzzyMatch = allModels.find(m => modelId.includes(m.id) || m.id.includes(modelId));
+        if (fuzzyMatch) {
+            logger.info('CEO', `LLM 为「${roleName}」推荐模型（模糊匹配）：${fuzzyMatch.id}`);
+            return fuzzyMatch.id;
+        }
+
+        logger.warn('CEO', `LLM 推荐的模型「${modelId}」不在可用列表中`);
+        return null;
+    }
+
+    /**
+     * 使用 LLM 判断子任务是否需要人工介入
+     * 比硬编码关键词更智能，能理解语义上下文
+     * @param {object} agent - 当前 Agent
+     * @param {string} subtask - 子任务描述
+     * @returns {Promise<boolean>}
+     */
+    async _checkHumanInterventionNeeded(agent, subtask) {
+        const state = this.getState();
+        const ceoAgent = state.agents.find(a => a.name === 'CEO');
+        const ceoModel = ceoAgent?.model || state.defaultModel || '';
+        if (!ceoModel) return false;
+
+        try {
+            const prompt = `判断以下子任务在自动化执行时，是否需要暂停并请求人类用户手动操作或介入。
+
+需要人工介入的典型场景包括但不限于：
+- 需要登录账号、扫码、输入验证码
+- 需要人脸识别、指纹验证等生物认证
+- 需要支付、转账、确认订单等金融操作
+- 需要绑定手机、邮箱等个人信息
+- 需要 OAuth 授权、第三方登录
+- 需要物理世界操作（如拍照、签名）
+
+子任务：「${subtask}」
+执行者：${agent.name}（${agent.role}）
+
+只返回 "YES" 或 "NO"，不要返回其他任何文字。`;
+
+            const result = await this._callLLMWithRetry({
+                model: ceoModel,
+                messages: [{ role: 'user', content: prompt }],
+                availableModels: state.availableModels,
+            });
+
+            const answer = (result || '').trim().toUpperCase();
+            const needsIntervention = answer.includes('YES');
+            if (needsIntervention) {
+                logger.info('CEO', `LLM 判断子任务「${subtask}」需要人工介入`);
+            }
+            return needsIntervention;
+        } catch (e) {
+            logger.warn('CEO', `LLM 人工介入判断失败: ${e.message}，默认不介入`);
+            return false;
+        }
     }
 
     /**
@@ -160,7 +247,7 @@ export class CEOAgentRunner {
         const teamAgents = [];
         const state2 = this.getState();
         for (const roleInfo of decomposition.roles) {
-            const recommendedModel = this._autoRecommendModel(roleInfo.name);
+            const recommendedModel = await this._autoRecommendModel(roleInfo.name);
             // 优先查找已有的同名 Agent 进行复用
             const existing = state2.agents.find(a => a.name === roleInfo.name && a.id !== ceoAgent.id);
             let agent;
@@ -362,24 +449,35 @@ export class CEOAgentRunner {
 
         const completedPhases = new Set();
         let noProgressTicks = 0;
-        const MAX_IDLE_TICKS = 40; // ~20s (40 * 500ms)
+        const MAX_IDLE_TICKS = 40;
 
-        // 按依赖关系调度
+        // 并行调度：每轮找出所有依赖已满足的任务，并发执行
         while (completedPhases.size < tasks.length) {
             const doneBeforeLoop = completedPhases.size;
-            for (const task of tasks) {
-                if (completedPhases.has(task.phase)) continue;
 
-                // 检查依赖是否满足
-                const depsReady = task.dependencies.every(dep => completedPhases.has(dep));
-                if (!depsReady) continue;
+            // 收集本轮可执行的任务
+            const readyTasks = tasks.filter(task => {
+                if (completedPhases.has(task.phase)) return false;
+                return task.dependencies.every(dep => completedPhases.has(dep));
+            });
 
-                const agent = teamAgents.find(a => a.name === task.assignee);
-                if (!agent) continue;
+            if (readyTasks.length > 0) {
+                // 并行执行所有就绪任务
+                if (readyTasks.length > 1) {
+                    this._emitCEOMessage(ceoAgent, [
+                        `【CEO】⚡ 检测到 ${readyTasks.length} 个无依赖任务，启动并行执行：`,
+                        ...readyTasks.map(t => `  🚀 ${t.assignee} → ${t.phase}`),
+                    ], ['并行执行任务']);
+                }
 
-                // 执行该阶段
-                await this._executeAgentPhase(ceoAgent, agent, task, completedPhases);
-                completedPhases.add(task.phase);
+                const execPromises = readyTasks.map(async (task) => {
+                    const agent = teamAgents.find(a => a.name === task.assignee);
+                    if (!agent) return;
+                    await this._executeAgentPhase(ceoAgent, agent, task, completedPhases);
+                    completedPhases.add(task.phase);
+                });
+
+                await Promise.all(execPromises);
 
                 // 更新 CEO 进度
                 const overallProgress = 0.25 + (completedPhases.size / tasks.length) * 0.7;
@@ -599,8 +697,8 @@ export class CEOAgentRunner {
                 result.content
             );
 
-            // 检测是否需要董事长人工介入
-            const needsHumanIntervention = ['登录', '验证码', '扫码', '确认账号', '支付', '人脸', '绑定'].some(k => subtask.includes(k));
+            // 使用 LLM 智能判断是否需要董事长人工介入
+            const needsHumanIntervention = await this._checkHumanInterventionNeeded(agent, subtask);
             if (needsHumanIntervention) {
                 const humanResult = await this._requestHumanIntervention(agent, subtask);
                 if (humanResult === 'TIMEOUT_ABORT') return;
@@ -846,10 +944,14 @@ export class CEOAgentRunner {
         const sessionContext = this._buildSessionContext();
         const currentObjective = state.currentObjective || '';
 
+        // 注入 Agent 记忆上下文
+        const memoryContext = formatMemoryContext(agent.name);
+
         const systemPrompt = [
             `你是团队成员「${agent.name}」，角色：${agent.role}。`,
             `当前项目目标：「${currentObjective}」`,
             sessionContext ? `\n### 项目背景与上下文\n${sessionContext}\n` : '',
+            memoryContext,
             '你正在执行一个具体的工作子任务。请直接输出实质性工作成果。',
             '要求：Markdown 格式，200-500 字中文，具体可用，不是概述。',
             '重要：请结合以上项目背景和上下文来理解当前任务，不要脱离上下文给出泛泛的通用回答。',
@@ -897,6 +999,47 @@ export class CEOAgentRunner {
 
         const fallbackLines = DIALOGUE_TEMPLATES.executing(agent.name, subtask, progress * 0.8);
         return { summary: fallbackLines, content: fallbackLines.join('\n'), source: 'template' };
+    }
+
+    /**
+     * 质量自动审核 (QA Self-Review)
+     * @returns {'pass'|'revise'} 审核结果
+     */
+    async _qualityReview(agent, task, outputContent) {
+        try {
+            const state = this.getState();
+            const ceoAgent = state.agents.find(a => a.name === 'CEO');
+            const availableModels = state.availableModels;
+
+            const prompt = [
+                `你是质量审核员。请评审以下工作成果是否达标。`,
+                `任务：${task}`,
+                `执行者：${agent.name}（${agent.role}）`,
+                `\n产出内容：\n${(outputContent || '').slice(0, 1500)}`,
+                `\n评审标准：`,
+                `1. 是否与任务直接相关（而非泛泛而谈）`,
+                `2. 是否包含具体可执行的内容`,
+                `3. 是否有合理的结构和格式`,
+                `\n只回复 JSON：{"result": "pass"} 或 {"result": "revise", "suggestion": "具体修改建议"}`,
+            ].join('\n');
+
+            const response = await sendChat({
+                model: ceoAgent?.model || '',
+                messages: [{ role: 'user', content: prompt }],
+                availableModels,
+                agentName: 'QA-Review',
+                dispatch: this.dispatch,
+            });
+
+            const jsonMatch = response.match(/\{[\s\S]*?\}/);
+            if (jsonMatch) {
+                const parsed = JSON.parse(jsonMatch[0]);
+                return parsed.result === 'pass' ? 'pass' : 'revise';
+            }
+        } catch (e) {
+            logger.warn('QA', `质量审核异常：${e.message}`);
+        }
+        return 'pass'; // 审核失败默认通过
     }
 
     /**
@@ -1293,9 +1436,126 @@ export class CEOAgentRunner {
     _delay(ms) {
         return new Promise((resolve, reject) => {
             if (this._aborted) { resolve(); return; }
-            const timer = setTimeout(resolve, ms);
+            const timer = setTimeout(async () => {
+                // 暂停检查：如果处于暂停状态，等待恢复
+                if (this._paused) {
+                    await new Promise(r => { this._pauseResolve = r; });
+                }
+                resolve();
+            }, ms);
             this.timers.push(timer);
         });
+    }
+
+    /**
+     * 暂停执行（董事长可在运行中暂停）
+     */
+    pause() {
+        if (!this.isRunning) return;
+        this._paused = true;
+        const state = this.getState();
+        const ceoAgent = state.agents.find(a => a.name === 'CEO');
+        if (ceoAgent) {
+            this.dispatch({
+                type: 'UPDATE_AGENT',
+                payload: {
+                    id: ceoAgent.id,
+                    state: AGENT_STATES.WAITING,
+                    currentTask: '已暂停 - 等待董事长指令',
+                },
+            });
+            this._emitCEOMessage(ceoAgent, [
+                '【CEO】⏸️ 收到董事长指令，执行已暂停。',
+                '您可以重组团队后恢复执行，或直接恢复继续。',
+            ], ['等待董事长操作']);
+        }
+        this.dispatch({ type: 'SET_STATUS', payload: 'paused' });
+        logger.info('CEO', '执行已暂停');
+    }
+
+    /**
+     * 从暂停状态恢复执行
+     */
+    unpause() {
+        if (!this._paused) return;
+        this._paused = false;
+        const state = this.getState();
+        const ceoAgent = state.agents.find(a => a.name === 'CEO');
+        if (ceoAgent) {
+            this.dispatch({
+                type: 'UPDATE_AGENT',
+                payload: {
+                    id: ceoAgent.id,
+                    state: AGENT_STATES.EXECUTING,
+                    currentTask: '恢复执行',
+                },
+            });
+            this._emitCEOMessage(ceoAgent, [
+                '【CEO】▶️ 收到董事长指令，恢复执行！',
+            ], ['继续调度后续阶段']);
+        }
+        this.dispatch({ type: 'SET_STATUS', payload: 'running' });
+        // 唤醒暂停等待
+        if (this._pauseResolve) {
+            this._pauseResolve();
+            this._pauseResolve = null;
+        }
+        logger.info('CEO', '执行已恢复');
+    }
+
+    /**
+     * 热重组团队（在暂停状态下调用）
+     * @param {object} changes - { add: [{name, role, color}], remove: [agentId], update: [{id, role, model}] }
+     */
+    restructure(changes = {}) {
+        const state = this.getState();
+        const ceoAgent = state.agents.find(a => a.name === 'CEO');
+        const actionLogs = [];
+
+        // 添加新 Agent
+        if (changes.add && changes.add.length > 0) {
+            for (const info of changes.add) {
+                const agent = createAgent({
+                    name: info.name,
+                    role: info.role,
+                    color: info.color || '#3B82F6',
+                    parentId: ceoAgent?.id,
+                    model: info.model || '',
+                });
+                this.dispatch({ type: 'ADD_AGENT', payload: agent });
+                actionLogs.push(`  ✅ 新增成员：${info.name}（${info.role}）`);
+            }
+        }
+
+        // 移除 Agent
+        if (changes.remove && changes.remove.length > 0) {
+            for (const agentId of changes.remove) {
+                const agent = state.agents.find(a => a.id === agentId);
+                if (agent && agent.name !== 'CEO') {
+                    this.dispatch({ type: 'REMOVE_AGENT', payload: agentId });
+                    actionLogs.push(`  ❌ 移除成员：${agent.name}`);
+                }
+            }
+        }
+
+        // 更新 Agent
+        if (changes.update && changes.update.length > 0) {
+            for (const upd of changes.update) {
+                this.dispatch({ type: 'UPDATE_AGENT', payload: upd });
+                const agent = state.agents.find(a => a.id === upd.id);
+                actionLogs.push(`  🔄 更新成员：${agent?.name || upd.id}`);
+            }
+        }
+
+        if (ceoAgent && actionLogs.length > 0) {
+            this._emitCEOMessage(ceoAgent, [
+                '【CEO】🔄 团队重组完成：',
+                ...actionLogs,
+                '请点击「▶️ 恢复执行」继续。',
+            ], ['等待董事长恢复执行']);
+        }
+
+        logger.info('CEO', `团队重组：${actionLogs.length} 项变更`);
     }
 
     /**
