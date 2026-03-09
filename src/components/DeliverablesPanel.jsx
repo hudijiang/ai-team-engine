@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useStore } from '../store/store';
 import { exportAsMarkdown, exportAsHTML, exportAsPDF } from '../utils/exportUtils';
+import MarkdownRenderer from './MarkdownRenderer';
 
 /**
  * 交付物面板
@@ -88,7 +89,9 @@ export default function DeliverablesPanel() {
                         </div>
                         {isOpen && (
                             <div className="deliverable-card__body">
-                                <pre>{item.content}</pre>
+                                <div style={{ background: 'var(--bg-tertiary)', padding: '16px', borderRadius: '8px', border: '1px solid var(--border-primary)' }}>
+                                    <MarkdownRenderer text={item.content || ''} />
+                                </div>
                             </div>
                         )}
                     </div>
