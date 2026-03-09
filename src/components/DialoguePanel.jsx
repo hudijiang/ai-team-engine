@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useStore } from '../store/store';
 import { STATE_COLORS } from '../engine/agentEngine';
+import MarkdownRenderer from './MarkdownRenderer';
 
 /**
  * 对话流面板
@@ -258,9 +259,9 @@ export default function DialoguePanel() {
                                         {msg.source === 'template' && <span className="badge badge-fallback">模板</span>}
                                         {msg.source === 'error' && <span className="badge badge-error">错误</span>}
                                     </div>
-                                    {msg.dialogue && msg.dialogue.map((line, i) => (
-                                        <p key={i}>{line}</p>
-                                    ))}
+                                    {msg.dialogue && (
+                                        <MarkdownRenderer text={msg.dialogue.join('\n')} />
+                                    )}
                                     {/* 多模态：图片渲染 */}
                                     {msg.imageUrl && (
                                         <div style={{ marginTop: '8px' }}>
