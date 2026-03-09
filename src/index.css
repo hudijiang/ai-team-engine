@@ -1734,6 +1734,16 @@ body {
   background: var(--accent-emerald);
 }
 
+.model-config-panel__autosave {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .model-config-panel__note {
   font-size: 0.7rem;
   color: var(--text-muted);
