@@ -93,9 +93,9 @@ export default function DeliverablesPanel() {
                                         onMouseDown={e => e.stopPropagation()}
                                     >
                                         {[
-                                            { key: 'md', icon: '📝', label: 'Markdown (.md)' },
-                                            { key: 'html', icon: '🌐', label: '网页 (.html)' },
-                                            { key: 'pdf', icon: '📄', label: '打印 (.pdf)' },
+                                            { key: 'md', icon: '📝', label: '导出 Markdown' },
+                                            { key: 'html', icon: '🌐', label: '导出 HTML' },
+                                            { key: 'pdf', icon: '📄', label: '导出 PDF' },
                                         ].map(fmt => (
                                             <button
                                                 key={fmt.key}
