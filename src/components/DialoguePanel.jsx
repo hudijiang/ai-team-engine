@@ -208,6 +208,11 @@ export default function DialoguePanel() {
                         const showJson = expandedJson.has(idx);
                         const showDetails = !expandedDetails.has(idx); // 默认展开，点击收起
 
+                        // 判断是否为该 Agent 的当期活跃消息（即最后一条且全局状态为运行中）
+                        const agentData = agents.find(a => a.id === msg.agentId) || {};
+                        const isLatestForAgent = filteredMessages.findLastIndex(m => m.agentId === msg.agentId) === idx;
+                        const isCurrentlyActive = ['planning', 'executing', 'reviewing', 'tool_use'].includes(agentData.state) && isLatestForAgent;
+
                         // 构建符合要求的结构化 JSON
                         const structuredJson = {
                             role: msg.role,
@@ -226,9 +231,18 @@ export default function DialoguePanel() {
                                 style={{ '--msg-color': msgColor }}
                             >
                                 <div className="message-bubble__header">
-                                    <span className="message-bubble__role">{msg.role}</span>
+                                    <span className="message-bubble__role">
+                                        {msg.role}
+                                        {isCurrentlyActive && (
+                                            <span
+                                                className="pulse-indicator"
+                                                style={{ backgroundColor: stateColor }}
+                                                title="正在执行..."
+                                            />
+                                        )}
+                                    </span>
                                     <div className="message-bubble__meta">
-                                        <span className="message-bubble__state" style={{ color: stateColor }}>
+                                        <span className={`message-bubble__state ${isCurrentlyActive ? 'state-active' : ''}`} style={{ color: stateColor }}>
                                             {msg.state}
                                         </span>
                                         <span className="message-bubble__time">

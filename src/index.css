@@ -1272,6 +1272,52 @@ body {
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.05);
   color: var(--text-muted);
+  transition: all 0.3s;
+}
+
+.message-bubble__state.state-active {
+  background: rgba(255, 255, 255, 0.15);
+  color: var(--text-primary) !important;
+  font-weight: 600;
+  box-shadow: 0 0 8px currentColor;
+  animation: glow 1.5s ease-in-out infinite alternate;
+}
+
+@keyframes glow {
+  from {
+    box-shadow: 0 0 2px currentColor;
+  }
+
+  to {
+    box-shadow: 0 0 10px currentColor;
+  }
+}
+
+.pulse-indicator {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-left: 8px;
+  box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.7);
+  animation: pulse-ring 1.5s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+}
+
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.7);
+  }
+
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 6px rgba(255, 255, 255, 0);
+  }
+
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0);
+  }
 }
 
 .message-bubble__time {
