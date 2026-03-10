@@ -314,7 +314,9 @@ export default function DialoguePanel() {
                                                 <div style={{ fontWeight: 600, marginBottom: 4, color: 'var(--accent-green)' }}>
                                                     📄 工作成果
                                                 </div>
-                                                <pre className="output-expand__content">{msg.outputContent}</pre>
+                                                <div className="output-expand__content" style={{ whiteSpace: 'normal', padding: '16px' }}>
+                                                    <MarkdownRenderer text={msg.outputContent} />
+                                                </div>
                                             </div>
                                         )}
                                     </div>
