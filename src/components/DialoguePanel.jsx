@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { useStore } from '../store/store';
 import { STATE_COLORS } from '../engine/agentEngine';
 import MarkdownRenderer from './MarkdownRenderer';
+import { exportAsMarkdown, exportAsHTML, exportAsPDF } from '../utils/exportUtils';
 
 /**
  * 对话流面板
@@ -16,9 +18,34 @@ export default function DialoguePanel() {
     const [expandedJson, setExpandedJson] = useState(new Set());
     const [expandedDetails, setExpandedDetails] = useState(new Set());
     const [expandedSessions, setExpandedSessions] = useState(new Set());
+    const [showExportMenu, setShowExportMenu] = useState(null);
+    const [menuPosition, setMenuPosition] = useState({ top: 0, right: 0 });
     const sessionHistory = useStore(s => s.sessionHistory) || [];
     const dispatch = useStore(s => s.dispatch);
     const scrollRef = useRef(null);
+
+    // 处理点击外部关闭菜单
+    useEffect(() => {
+        const handleClickOutside = () => setShowExportMenu(null);
+        if (showExportMenu) {
+            document.addEventListener('mousedown', handleClickOutside);
+            window.addEventListener('scroll', handleClickOutside, true);
+        }
+        return () => {
+            document.removeEventListener('mousedown', handleClickOutside);
+            window.removeEventListener('scroll', handleClickOutside, true);
+        };
+    }, [showExportMenu]);
+
+    const handleDeliverableExport = (msg, format) => {
+        const title = (msg.current_task || '汇报产出').replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, '_');
+        switch (format) {
+            case 'md': exportAsMarkdown(msg.outputContent || '', title); break;
+            case 'html': exportAsHTML(msg.outputContent || '', title); break;
+            case 'pdf': exportAsPDF(msg.outputContent || '', title); break;
+        }
+        setShowExportMenu(null);
+    };
 
     // 获取 Agent 颜色映射
     const agentColorMap = useMemo(() => {
@@ -311,8 +338,54 @@ export default function DialoguePanel() {
                                         {/* 实质产出内容 */}
                                         {msg.outputContent && (
                                             <div className="output-expand" style={{ marginTop: 8 }}>
-                                                <div style={{ fontWeight: 600, marginBottom: 4, color: 'var(--accent-green)' }}>
-                                                    📄 工作成果
+                                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                                                    <div style={{ fontWeight: 600, color: 'var(--accent-green)' }}>
+                                                        📄 工作成果
+                                                    </div>
+                                                    <div>
+                                                        <button
+                                                            className={`btn-outline ${showExportMenu === msgKey ? 'active' : ''}`}
+                                                            style={{ padding: '2px 8px', fontSize: '0.75rem', display: 'flex', alignItems: 'center' }}
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                if (showExportMenu === msgKey) {
+                                                                    setShowExportMenu(null);
+                                                                } else {
+                                                                    const rect = e.currentTarget.getBoundingClientRect();
+                                                                    setMenuPosition({
+                                                                        top: rect.bottom + 4,
+                                                                        right: window.innerWidth - rect.right
+                                                                    });
+                                                                    setShowExportMenu(msgKey);
+                                                                }
+                                                            }}>
+                                                            <span style={{ marginRight: '4px' }}>⬇️</span> 导出
+                                                        </button>
+                                                        {showExportMenu === msgKey && createPortal(
+                                                            <div
+                                                                className="export-dropdown-menu"
+                                                                style={{ position: 'fixed', top: menuPosition.top, right: menuPosition.right, zIndex: 1000 }}
+                                                                onClick={e => e.stopPropagation()}
+                                                                onMouseDown={e => e.stopPropagation()}
+                                                            >
+                                                                {[
+                                                                    { key: 'md', icon: '📝', label: '导出 Markdown' },
+                                                                    { key: 'html', icon: '🌐', label: '导出 HTML' },
+                                                                    { key: 'pdf', icon: '📄', label: '导出 PDF' },
+                                                                ].map(fmt => (
+                                                                    <button
+                                                                        key={fmt.key}
+                                                                        className="export-dropdown-item"
+                                                                        onClick={(e) => { e.stopPropagation(); handleDeliverableExport(msg, fmt.key); }}
+                                                                    >
+                                                                        <span className="export-icon">{fmt.icon}</span>
+                                                                        {fmt.label}
+                                                                    </button>
+                                                                ))}
+                                                            </div>,
+                                                            document.body
+                                                        )}
+                                                    </div>
                                                 </div>
                                                 <div className="output-expand__content" style={{ whiteSpace: 'normal', padding: '16px' }}>
                                                     <MarkdownRenderer text={msg.outputContent} />
