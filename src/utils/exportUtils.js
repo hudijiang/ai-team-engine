@@ -3,99 +3,23 @@
  * 支持将交付物导出为 Markdown / HTML / PDF 三种格式
  */
 
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
+
 /**
  * 简易 Markdown → HTML 转换器
- * 支持标题、列表、表格、代码块、加粗、斜体
+ * 使用 marked 库进行健壮且完整的 Markdown 渲染
  */
 function markdownToHTML(md) {
     if (!md) return '';
-
-    // 1. 保护代码块
-    const codeBlocks = [];
-    let html = md.replace(/```([\s\S]*?)```/g, (match, code) => {
-        codeBlocks.push(code);
-        return `__CODE_BLOCK_${codeBlocks.length - 1}__`;
+    marked.setOptions({
+        gfm: true,
+        breaks: true,
+        headerIds: false,
+        mangle: false
     });
-
-    // 2. 基础块级格式化
-    html = html
-        .replace(/^#{5}\s+(.+)$/gm, '<h5>$1</h5>')
-        .replace(/^#{4}\s+(.+)$/gm, '<h4>$1</h4>')
-        .replace(/^#{3}\s+(.+)$/gm, '<h3>$1</h3>')
-        .replace(/^#{2}\s+(.+)$/gm, '<h2>$1</h2>')
-        .replace(/^#\s+(.+)$/gm, '<h1>$1</h1>')
-        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-        .replace(/\*(.+?)\*/g, '<em>$1</em>')
-        .replace(/`([^`]+)`/g, '<code>$1</code>');
-
-    // 3. 处理连续的列表项 (包裹 ul/ol)
-    html = html.replace(/(?:^[-*]\s+.+(?:\n|$))+/gm, (match) => {
-        const items = match.trim().split('\n').map(item => `<li>${item.replace(/^[-*]\s+/, '')}</li>`);
-        return `<ul>${items.join('')}</ul>\n`;
-    });
-    html = html.replace(/(?:^\d+\.\s+.+(?:\n|$))+/gm, (match) => {
-        const items = match.trim().split('\n').map(item => `<li>${item.replace(/^\d+\.\s+/, '')}</li>`);
-        return `<ol>${items.join('')}</ol>\n`;
-    });
-
-    // 4. 表格处理
-    html = html.replace(/(?:^\|.+?\|(?:\n|$))+/gm, (match) => {
-        const rows = match.trim().split('\n').filter(r => !r.match(/^\|[\s\-|]+\|$/));
-        if (rows.length === 0) return '';
-        const parseRow = (r) => r.split('|').filter((_, i, arr) => i > 0 && i < arr.length - 1).map(c => c.trim());
-        let ths = parseRow(rows[0]).map(c => `<th>${c}</th>`).join('');
-        let trs = rows.slice(1).map(r => `<tr>${parseRow(r).map(c => `<td>${c}</td>`).join('')}</tr>`).join('');
-        return `<table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>\n`;
-    });
-
-    // 5. 段落和换行处理（避免包裹 HTML 标签）
-    const lines = html.split('\n');
-    let inBlock = false;
-    let outHtml = [];
-
-    for (let i = 0; i < lines.length; i++) {
-        let line = lines[i].trim();
-        if (line === '') {
-            if (inBlock) { outHtml.push('</p>'); inBlock = false; }
-            continue;
-        }
-        if (line.match(/^<(h[1-6]|ul|ol|table)/)) {
-            if (inBlock) { outHtml.push('</p>'); inBlock = false; }
-            outHtml.push(line);
-            continue;
-        }
-        if (line.match(/^__CODE_BLOCK_/)) {
-            if (inBlock) { outHtml.push('</p>'); inBlock = false; }
-            outHtml.push(line);
-            continue;
-        }
-
-        if (!inBlock) {
-            outHtml.push('<p>');
-            inBlock = true;
-        }
-        outHtml.push(line + (i < lines.length - 1 && lines[i + 1].trim() !== '' && !lines[i + 1].match(/^</) ? '<br/>' : ''));
-    }
-    if (inBlock) outHtml.push('</p>');
-    html = outHtml.join('\n');
-
-    // 6. 还原代码块
-    html = html.replace(/__CODE_BLOCK_(\d+)__/g, (match, index) => {
-        let codeContent = codeBlocks[index];
-        let lang = '';
-        if (codeContent.startsWith('\n')) {
-            codeContent = codeContent.substring(1);
-        } else {
-            const firstLineEnd = codeContent.indexOf('\n');
-            if (firstLineEnd !== -1) {
-                lang = codeContent.substring(0, firstLineEnd).trim();
-                codeContent = codeContent.substring(firstLineEnd + 1);
-            }
-        }
-        return `<pre><code class="lang-${lang}">${codeContent}</code></pre>`;
-    });
-
-    return html;
+    const rawHtml = marked.parse(md);
+    return DOMPurify.sanitize(rawHtml);
 }
 
 /**

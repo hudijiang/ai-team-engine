@@ -55,36 +55,33 @@ export default function DeliverablesPanel() {
                                 <div className="deliverable-card__meta">{item.timestamp ? new Date(item.timestamp).toLocaleString('zh-CN', { hour12: false }) : ''}</div>
                             </div>
                             <div className="deliverable-card__actions" style={{ position: 'relative' }}>
-                                <button onClick={(e) => {
+                                <button className={`btn-outline ${isMenuOpen ? 'active' : ''}`} onClick={(e) => {
                                     e.stopPropagation();
                                     setShowExportMenu(isMenuOpen ? null : item.id);
-                                }}>⬇️ 导出</button>
+                                }}>
+                                    <span style={{ marginRight: '4px' }}>⬇️</span> 导出
+                                </button>
                                 {isMenuOpen && (
-                                    <div style={{
-                                        position: 'absolute', top: '100%', right: 0, zIndex: 100,
-                                        background: 'var(--bg-secondary)', border: '1px solid var(--border-primary)',
-                                        borderRadius: '8px', padding: '4px', minWidth: '120px',
-                                        boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
-                                    }}>
+                                    <div className="export-dropdown-menu">
                                         {[
-                                            { key: 'md', icon: '📝', label: 'Markdown' },
-                                            { key: 'html', icon: '🌐', label: 'HTML' },
-                                            { key: 'pdf', icon: '📄', label: 'PDF' },
+                                            { key: 'md', icon: '📝', label: 'Markdown (.md)' },
+                                            { key: 'html', icon: '🌐', label: '网⻚ (.html)' },
+                                            { key: 'pdf', icon: '📄', label: '打印 (.pdf)' },
                                         ].map(fmt => (
-                                            <button key={fmt.key} onClick={(e) => { e.stopPropagation(); handleExport(item, fmt.key); }}
-                                                style={{
-                                                    display: 'block', width: '100%', padding: '6px 12px',
-                                                    background: 'transparent', border: 'none', color: 'var(--text-primary)',
-                                                    textAlign: 'left', cursor: 'pointer', borderRadius: '4px',
-                                                    fontSize: '0.8rem',
-                                                }}
-                                                onMouseEnter={e => e.target.style.background = 'var(--bg-tertiary)'}
-                                                onMouseLeave={e => e.target.style.background = 'transparent'}
-                                            >{fmt.icon} {fmt.label}</button>
+                                            <button
+                                                key={fmt.key}
+                                                className="export-dropdown-item"
+                                                onClick={(e) => { e.stopPropagation(); handleExport(item, fmt.key); }}
+                                            >
+                                                <span className="export-icon">{fmt.icon}</span>
+                                                {fmt.label}
+                                            </button>
                                         ))}
                                     </div>
                                 )}
-                                <button onClick={(e) => { e.stopPropagation(); toggle(item.id); }}>{isOpen ? '收起' : '展开'}</button>
+                                <button className="btn-outline" onClick={(e) => { e.stopPropagation(); toggle(item.id); }}>
+                                    {isOpen ? '收起' : '展开'}
+                                </button>
                             </div>
                         </div>
                         {isOpen && (
