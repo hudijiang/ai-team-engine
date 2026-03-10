@@ -658,9 +658,17 @@ body {
   cursor: pointer;
 }
 
+.deliverable-card__header>div:first-child {
+  flex: 1;
+  min-width: 0;
+  padding-right: 12px;
+}
+
 .deliverable-card__title {
   font-weight: 700;
   color: var(--text-primary);
+  white-space: normal;
+  word-break: break-all;
 }
 
 .deliverable-card__meta {
@@ -672,6 +680,7 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .deliverable-card__actions .btn-outline {
@@ -685,6 +694,7 @@ body {
   cursor: pointer;
   font-size: 0.8rem;
   transition: all 0.2s;
+  white-space: nowrap;
 }
 
 .deliverable-card__actions .btn-outline:hover,
