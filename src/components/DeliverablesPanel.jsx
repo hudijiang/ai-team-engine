@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { useStore } from '../store/store';
 import { exportAsMarkdown, exportAsHTML, exportAsPDF } from '../utils/exportUtils';
 import MarkdownRenderer from './MarkdownRenderer';
@@ -11,6 +12,20 @@ export default function DeliverablesPanel() {
     const deliverables = useStore(s => s.deliverables) || [];
     const [expanded, setExpanded] = useState(new Set());
     const [showExportMenu, setShowExportMenu] = useState(null);
+    const [menuPosition, setMenuPosition] = useState({ top: 0, right: 0 });
+
+    // 处理点击外部关闭菜单
+    useEffect(() => {
+        const handleClickOutside = () => setShowExportMenu(null);
+        if (showExportMenu) {
+            document.addEventListener('mousedown', handleClickOutside);
+            window.addEventListener('scroll', handleClickOutside, true); // 捕获滚动事件以关闭弹窗，防止错位
+        }
+        return () => {
+            document.removeEventListener('mousedown', handleClickOutside);
+            window.removeEventListener('scroll', handleClickOutside, true);
+        };
+    }, [showExportMenu]);
 
     const toggle = (id) => {
         setExpanded(prev => {
@@ -54,18 +69,32 @@ export default function DeliverablesPanel() {
                                 <div className="deliverable-card__title">{item.title}</div>
                                 <div className="deliverable-card__meta">{item.timestamp ? new Date(item.timestamp).toLocaleString('zh-CN', { hour12: false }) : ''}</div>
                             </div>
-                            <div className="deliverable-card__actions" style={{ position: 'relative' }}>
+                            <div className="deliverable-card__actions">
                                 <button className={`btn-outline ${isMenuOpen ? 'active' : ''}`} onClick={(e) => {
                                     e.stopPropagation();
-                                    setShowExportMenu(isMenuOpen ? null : item.id);
+                                    if (isMenuOpen) {
+                                        setShowExportMenu(null);
+                                    } else {
+                                        const rect = e.currentTarget.getBoundingClientRect();
+                                        setMenuPosition({
+                                            top: rect.bottom + 6,
+                                            right: window.innerWidth - rect.right
+                                        });
+                                        setShowExportMenu(item.id);
+                                    }
                                 }}>
                                     <span style={{ marginRight: '4px' }}>⬇️</span> 导出
                                 </button>
-                                {isMenuOpen && (
-                                    <div className="export-dropdown-menu">
+                                {isMenuOpen && createPortal(
+                                    <div
+                                        className="export-dropdown-menu"
+                                        style={{ position: 'fixed', top: menuPosition.top, right: menuPosition.right }}
+                                        onClick={e => e.stopPropagation()}
+                                        onMouseDown={e => e.stopPropagation()}
+                                    >
                                         {[
                                             { key: 'md', icon: '📝', label: 'Markdown (.md)' },
-                                            { key: 'html', icon: '🌐', label: '网⻚ (.html)' },
+                                            { key: 'html', icon: '🌐', label: '网页 (.html)' },
                                             { key: 'pdf', icon: '📄', label: '打印 (.pdf)' },
                                         ].map(fmt => (
                                             <button
@@ -77,7 +106,8 @@ export default function DeliverablesPanel() {
                                                 {fmt.label}
                                             </button>
                                         ))}
-                                    </div>
+                                    </div>,
+                                    document.body
                                 )}
                                 <button className="btn-outline" onClick={(e) => { e.stopPropagation(); toggle(item.id); }}>
                                     {isOpen ? '收起' : '展开'}
