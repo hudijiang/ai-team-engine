@@ -117,3 +117,10 @@
 .md-link:hover {
     text-decoration: underline;
 }
+
+.md-content hr {
+    border: none;
+    height: 1px;
+    background-color: var(--border-primary);
+    margin: 24px 0;
+}
