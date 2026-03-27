@@ -2,8 +2,9 @@
  * 模型 API 配置管理
  * 管理各供应商的 API URL 和 API Key
  * 支持通过 API 动态获取可用模型列表
- * 使用 localStorage 持久化存储
+ * 使用本地 bootstrap + IndexedDB 完整持久化
  */
+import { createPersistentResource } from '../utils/persistentResource.js';
 
 /** localStorage 存储键 */
 const STORAGE_KEY = 'agent-auto-provider-configs';
@@ -79,34 +80,7 @@ export const PROVIDERS = [
     },
 ];
 
-/**
- * 从 localStorage 加载供应商配置
- * @returns {Object<string, {apiUrl: string, apiKey: string}>}
- */
-export function loadProviderConfigs() {
-    try {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) {
-            const parsed = JSON.parse(saved);
-
-            // 与最新 PROVIDERS 合并，确保新增供应商拥有默认配置
-            const merged = {};
-            PROVIDERS.forEach(p => {
-                merged[p.id] = {
-                    apiUrl: p.defaultApiUrl,
-                    apiKey: '',
-                    enabled: false,
-                    ...(parsed[p.id] || {}),
-                };
-            });
-
-            return merged;
-        }
-    } catch (e) {
-        console.warn('加载供应商配置失败:', e);
-    }
-
-    // 返回默认配置（无 API Key）
+function buildDefaultProviderConfigs() {
     const defaults = {};
     PROVIDERS.forEach(p => {
         defaults[p.id] = {
@@ -118,36 +92,83 @@ export function loadProviderConfigs() {
     return defaults;
 }
 
+function mergeProviderConfigs(raw = {}) {
+    const defaults = buildDefaultProviderConfigs();
+    const merged = {};
+    PROVIDERS.forEach(p => {
+        merged[p.id] = {
+            ...defaults[p.id],
+            ...(raw[p.id] || {}),
+        };
+    });
+    return merged;
+}
+
+function stripApiKeys(configs = {}) {
+    const sanitized = {};
+    PROVIDERS.forEach(p => {
+        const current = configs[p.id] || {};
+        sanitized[p.id] = {
+            apiUrl: current.apiUrl || p.defaultApiUrl,
+            apiKey: '',
+            enabled: !!current.enabled,
+        };
+    });
+    return sanitized;
+}
+
+const providerConfigResource = createPersistentResource({
+    storageKey: STORAGE_KEY,
+    initialValue: buildDefaultProviderConfigs,
+    bootstrapSelector: stripApiKeys,
+});
+
+const modelsCacheResource = createPersistentResource({
+    storageKey: MODELS_CACHE_KEY,
+    initialValue: () => ({}),
+});
+
 /**
- * 保存供应商配置到 localStorage
+ * 从本地缓存加载供应商配置
+ * @returns {Object<string, {apiUrl: string, apiKey: string}>}
+ */
+export function loadProviderConfigs() {
+    return mergeProviderConfigs(providerConfigResource.get());
+}
+
+export async function ensureProviderConfigsHydrated() {
+    const hydrated = await providerConfigResource.hydrate();
+    const merged = mergeProviderConfigs(hydrated);
+    providerConfigResource.set(merged);
+    return merged;
+}
+
+/**
+ * 保存供应商配置
  * @param {Object} configs
  */
 export function saveProviderConfigs(configs) {
-    try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(configs));
-    } catch (e) {
-        console.warn('保存供应商配置失败:', e);
-    }
+    providerConfigResource.set(mergeProviderConfigs(configs));
 }
 
 /**
- * 从 localStorage 加载模型缓存
+ * 从本地缓存加载模型缓存
  */
 export function loadModelsCache() {
-    try {
-        const saved = localStorage.getItem(MODELS_CACHE_KEY);
-        if (saved) return JSON.parse(saved);
-    } catch (e) { /* ignore */ }
-    return {};
+    return modelsCacheResource.get() || {};
+}
+
+export async function ensureModelsCacheHydrated() {
+    const hydrated = await modelsCacheResource.hydrate();
+    modelsCacheResource.set(hydrated || {});
+    return modelsCacheResource.get() || {};
 }
 
 /**
- * 保存模型缓存到 localStorage
+ * 保存模型缓存
  */
 export function saveModelsCache(cache) {
-    try {
-        localStorage.setItem(MODELS_CACHE_KEY, JSON.stringify(cache));
-    } catch (e) { /* ignore */ }
+    modelsCacheResource.set(cache || {});
 }
 
 /**
@@ -222,7 +243,7 @@ export async function fetchModelsFromAPI(apiUrl, apiKey, providerId) {
  * @returns {Promise<Array<{id: string, name: string, provider: string, icon: string}>>}
  */
 export async function fetchAllModels() {
-    const configs = loadProviderConfigs();
+    const configs = await ensureProviderConfigsHydrated();
     const allModels = [];
 
     for (const provider of PROVIDERS) {
@@ -269,7 +290,11 @@ export function getCachedModels() {
 export default {
     PROVIDERS,
     loadProviderConfigs,
+    ensureProviderConfigsHydrated,
     saveProviderConfigs,
+    loadModelsCache,
+    ensureModelsCacheHydrated,
+    saveModelsCache,
     fetchModelsFromAPI,
     fetchAllModels,
     getCachedModels,

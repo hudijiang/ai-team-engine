@@ -1,7 +1,14 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { useStore } from '../store/store';
-import { CEOAgentRunner } from '../engine/ceoAgent';
+import { clearRunner, getRunner, peekRunner, replaceRunner } from '../engine/runnerRuntime';
 import DecisionPanel from './DecisionPanel';
+import {
+    resolveDecisionAction,
+    skipHumanInputAction,
+    startExecutionFromCheckpoint,
+    submitHumanInputAction,
+} from './commandInputActions.js';
+import { restoreConfigCheckpoint, submitObjectiveCommand } from './commandInputLogic.js';
 
 /**
  * 董事长指令输入组件
@@ -9,21 +16,11 @@ import DecisionPanel from './DecisionPanel';
  */
 export default function CommandInput() {
     const [input, setInput] = useState('');
-    const runnerRef = useRef(null);
     const dispatch = useStore(s => s.dispatch);
     const getSnapshot = useStore(s => s.getSnapshot);
     const reset = useStore(s => s.reset);
     const systemStatus = useStore(s => s.systemStatus);
-
-    // 组件卸载时清理 runner
-    useEffect(() => {
-        return () => {
-            if (runnerRef.current) {
-                runnerRef.current.stop();
-                runnerRef.current = null;
-            }
-        };
-    }, []);
+    const workflowCheckpoint = useStore(s => s.workflowCheckpoint);
 
     const isRunning = systemStatus === 'running';
     const isCompleted = systemStatus === 'completed';
@@ -35,64 +32,69 @@ export default function CommandInput() {
 
     const [humanInput, setHumanInput] = useState('');
 
+    useEffect(() => {
+        restoreConfigCheckpoint({
+            systemStatus,
+            workflowCheckpoint,
+            dispatch,
+            getSnapshot,
+            getRunnerImpl: getRunner,
+        });
+    }, [systemStatus, workflowCheckpoint, dispatch, getSnapshot]);
+
     const handleSubmit = useCallback(() => {
-        const objective = input.trim();
-        if (!objective || isRunning || isWaitingConfig || isWaitingHuman || isPaused) return;
-
-        // 清理旧 runner（但不 RESET 会话，延续当前对话上下文）
-        if (runnerRef.current) {
-            runnerRef.current.stop();
-            runnerRef.current = null;
-        }
-
-        // 更新当前目标（不归档，延续同一会话）
-        dispatch({ type: 'SET_OBJECTIVE', payload: objective });
-        dispatch({
-            type: 'ADD_MESSAGE',
-            payload: {
-                role: '董事长',
-                state: 'idle',
-                current_task: '发布战略目标',
-                progress: 1.0,
-                collaborators: ['CEO'],
-                dialogue: [`📢 战略目标发布：「${objective}」`, '请CEO分析并组织执行。'],
-                next_step: [],
-                agentId: 'chairman',
-                timestamp: new Date().toISOString(),
-            },
+        const result = submitObjectiveCommand({
+            objective: input,
+            systemStatus,
+            dispatch,
+            getSnapshot,
+            clearRunnerImpl: clearRunner,
+            replaceRunnerImpl: replaceRunner,
         });
 
-        // 启动新的 CEO Agent（复用已有团队成员）
-        const runner = new CEOAgentRunner(dispatch, getSnapshot);
-        runnerRef.current = runner;
-        runner.start(objective);
-
-        setInput('');
-    }, [input, isRunning, isCompleted, isBlocked, isWaitingConfig, isWaitingHuman, dispatch, getSnapshot]);
+        if (result.status === 'started') {
+            setInput('');
+        }
+    }, [input, systemStatus, dispatch, getSnapshot]);
 
     /**
      * 董事长确认模型配置，恢复 CEO 执行
      */
     const handleStartExecution = useCallback(() => {
-        if (runnerRef.current) {
-            runnerRef.current.resume();
-        }
-    }, []);
+        startExecutionFromCheckpoint({
+            workflowCheckpoint,
+            dispatch,
+            getSnapshot,
+            getRunnerImpl: getRunner,
+        });
+    }, [dispatch, getSnapshot, workflowCheckpoint]);
 
     /**
      * 董事长提供人工输入
      */
     const handleHumanSubmit = useCallback(() => {
-        if (!humanInput.trim() || !runnerRef.current) return;
-        runnerRef.current.provideHumanInput(humanInput.trim());
-        setHumanInput('');
-    }, [humanInput]);
+        const result = submitHumanInputAction({
+            humanInput,
+            dispatch,
+            getSnapshot,
+            getRunnerImpl: getRunner,
+        });
+        if (result.status === 'submitted') {
+            setHumanInput('');
+        }
+    }, [humanInput, dispatch, getSnapshot]);
+
+    const handleHumanSkip = useCallback(() => {
+        skipHumanInputAction({
+            reason: 'FORCE_CONTINUE',
+            dispatch,
+            getSnapshot,
+            getRunnerImpl: getRunner,
+        });
+    }, [dispatch, getSnapshot]);
 
     const handleReset = useCallback(() => {
-        if (runnerRef.current) {
-            runnerRef.current.stop();
-            runnerRef.current = null;
-        }
+        clearRunner();
         reset();
         setInput('');
         setHumanInput('');
@@ -100,16 +102,12 @@ export default function CommandInput() {
 
     /** 暂停执行 */
     const handlePause = useCallback(() => {
-        if (runnerRef.current) {
-            runnerRef.current.pause();
-        }
+        peekRunner()?.pause();
     }, []);
 
     /** 恢复执行 */
     const handleUnpause = useCallback(() => {
-        if (runnerRef.current) {
-            runnerRef.current.unpause();
-        }
+        peekRunner()?.unpause();
     }, []);
 
     const handleKeyDown = (e) => {
@@ -160,7 +158,7 @@ export default function CommandInput() {
                         </button>
                         <button
                             className="command-input__reset"
-                            onClick={() => runnerRef.current?.skipHumanInput?.('FORCE_CONTINUE')}
+                            onClick={handleHumanSkip}
                             style={{ marginLeft: 8 }}
                         >
                             跳过此步
@@ -239,9 +237,13 @@ export default function CommandInput() {
             {isWaitingDecision && (
                 <DecisionPanel
                     onResolve={(idx, customText) => {
-                        if (runnerRef.current) {
-                            runnerRef.current.resolveDecision(idx, customText);
-                        }
+                        resolveDecisionAction({
+                            proposalIndex: idx,
+                            customText,
+                            dispatch,
+                            getSnapshot,
+                            getRunnerImpl: getRunner,
+                        });
                     }}
                 />
             )}

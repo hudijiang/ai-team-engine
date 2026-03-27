@@ -2,24 +2,38 @@
  * 前端轻量 RAG 引擎
  * 支持文档上传、分段存储、关键词检索，检索结果注入 Agent Prompt
  */
+import { createPersistentResource } from '../utils/persistentResource.js';
 
 const STORAGE_KEY = 'agent-auto-knowledge-base';
 const CHUNK_SIZE = 500; // 每段约 500 字
+const EMPTY_KB = { documents: [], chunks: [] };
+
+const knowledgeBaseResource = createPersistentResource({
+    storageKey: STORAGE_KEY,
+    initialValue: () => ({ ...EMPTY_KB }),
+    bootstrapSelector: (kb) => ({
+        documents: kb?.documents || [],
+        chunks: [],
+    }),
+});
 
 /**
  * 加载知识库
  */
 function loadKnowledgeBase() {
-    try {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        return saved ? JSON.parse(saved) : { documents: [], chunks: [] };
-    } catch (_) { return { documents: [], chunks: [] }; }
+    return knowledgeBaseResource.get() || EMPTY_KB;
 }
 
 function saveKnowledgeBase(kb) {
-    try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(kb));
-    } catch (_) { /* ignore */ }
+    knowledgeBaseResource.set(kb);
+}
+
+export async function ensureKnowledgeBaseHydrated() {
+    const hydrated = await knowledgeBaseResource.hydrate();
+    if (!hydrated) {
+        knowledgeBaseResource.set({ ...EMPTY_KB });
+    }
+    return knowledgeBaseResource.get() || EMPTY_KB;
 }
 
 /**
@@ -152,7 +166,15 @@ export function getKnowledgeStats() {
  * 清空知识库
  */
 export function clearKnowledge() {
-    saveKnowledgeBase({ documents: [], chunks: [] });
+    saveKnowledgeBase({ ...EMPTY_KB });
 }
 
-export default { addDocument, removeDocument, searchKnowledge, formatRAGContext, getKnowledgeStats, clearKnowledge };
+export default {
+    addDocument,
+    removeDocument,
+    searchKnowledge,
+    formatRAGContext,
+    getKnowledgeStats,
+    clearKnowledge,
+    ensureKnowledgeBaseHydrated,
+};

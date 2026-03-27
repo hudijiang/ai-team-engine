@@ -2,8 +2,14 @@
  * Token 追踪器
  * 估算每次 LLM 调用的 Token 消耗，按 Agent/Provider 聚合统计
  */
+import { createPersistentResource } from '../utils/persistentResource.js';
 
 const STORAGE_KEY = 'agent-auto-token-stats';
+const tokenRecordResource = createPersistentResource({
+    storageKey: STORAGE_KEY,
+    initialValue: () => ([]),
+    bootstrapSelector: (records) => (records || []).slice(-100),
+});
 
 /** Token 估算：中文约 1.5 字/token，英文约 4 字/token */
 function estimateTokens(text) {
@@ -46,23 +52,16 @@ function getPricing(modelId) {
 
 class TokenTracker {
     constructor() {
-        this.records = [];
-        this._loadFromStorage();
+        this.records = tokenRecordResource.get() || [];
+        void this._hydrate();
     }
 
-    _loadFromStorage() {
-        try {
-            const saved = localStorage.getItem(STORAGE_KEY);
-            if (saved) this.records = JSON.parse(saved);
-        } catch (_) { /* ignore */ }
+    async _hydrate() {
+        this.records = await tokenRecordResource.hydrate() || [];
     }
 
     _saveToStorage() {
-        try {
-            // 只保留最近 500 条
-            const toSave = this.records.slice(-500);
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
-        } catch (_) { /* ignore */ }
+        tokenRecordResource.set(this.records.slice(-500));
     }
 
     /**

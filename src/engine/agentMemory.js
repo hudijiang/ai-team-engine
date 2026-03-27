@@ -3,28 +3,30 @@
  * 为每个 Agent 提供跨会话的持久化记忆
  * 存储历史任务经验摘要，用于注入后续 LLM prompt
  */
+import { createPersistentResource } from '../utils/persistentResource.js';
 
 const STORAGE_KEY = 'agent-auto-memories';
 const MAX_MEMORIES_PER_AGENT = 5;
+
+const memoryResource = createPersistentResource({
+    storageKey: STORAGE_KEY,
+    initialValue: () => ({}),
+});
+
+void memoryResource.hydrate();
 
 /**
  * 加载所有 Agent 记忆
  */
 function loadAllMemories() {
-    try {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) return JSON.parse(saved);
-    } catch (_) { /* ignore */ }
-    return {};
+    return memoryResource.get() || {};
 }
 
 /**
  * 保存所有 Agent 记忆
  */
 function saveAllMemories(memories) {
-    try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(memories));
-    } catch (_) { /* ignore */ }
+    memoryResource.set(memories || {});
 }
 
 /**

@@ -1,23 +1,58 @@
 /**
  * 后端服务适配器
- * 统一的存储/API 抽象层，支持 localStorage（前端模式）和远程后端两种模式
+ * 统一的存储/API 抽象层，支持浏览器本地缓存和远程后端两种模式
  */
+import { createPersistentResource } from '../utils/persistentResource.js';
+import { loadIndexedValue, saveIndexedValue, deleteIndexedValue } from '../utils/indexedDBStorage.js';
 
 const CONFIG_KEY = 'agent-auto-backend-config';
+const DEFAULT_CONFIG = { useBackend: false, backendUrl: '', apiKey: '' };
+const backendConfigResource = createPersistentResource({
+    storageKey: CONFIG_KEY,
+    initialValue: () => ({ ...DEFAULT_CONFIG }),
+    bootstrapSelector: (config) => ({
+        useBackend: !!config?.useBackend,
+        backendUrl: config?.backendUrl || '',
+        apiKey: '',
+    }),
+});
+
+function normalizeConfig(config = {}) {
+    return {
+        ...DEFAULT_CONFIG,
+        ...config,
+        useBackend: !!config?.useBackend,
+        backendUrl: config?.backendUrl || '',
+        apiKey: config?.apiKey || '',
+    };
+}
+
+function readLegacyLocalCache(key) {
+    try {
+        const saved = localStorage.getItem(key);
+        if (!saved) return null;
+        return JSON.parse(saved);
+    } catch (_) {
+        return null;
+    }
+}
 
 /**
  * 加载后端配置
  */
-function loadConfig() {
-    try {
-        const saved = localStorage.getItem(CONFIG_KEY);
-        if (saved) return JSON.parse(saved);
-    } catch (_) { /* ignore */ }
-    return { useBackend: false, backendUrl: '', apiKey: '' };
+export function loadConfig() {
+    return normalizeConfig(backendConfigResource.get());
+}
+
+export async function ensureConfigHydrated() {
+    const hydrated = await backendConfigResource.hydrate();
+    const normalized = normalizeConfig(hydrated);
+    backendConfigResource.set(normalized);
+    return normalized;
 }
 
 export function saveConfig(config) {
-    localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
+    backendConfigResource.set(normalizeConfig(config));
 }
 
 /**
@@ -32,7 +67,7 @@ export function isBackendMode() {
  */
 export const storage = {
     async get(key) {
-        const config = loadConfig();
+        const config = await ensureConfigHydrated();
         if (config.useBackend) {
             try {
                 const res = await fetch(`${config.backendUrl}/api/storage/${key}`, {
@@ -40,21 +75,33 @@ export const storage = {
                 });
                 if (res.ok) return await res.json();
             } catch (e) {
-                console.warn('后端读取失败，降级到 localStorage:', e.message);
+                console.warn('后端读取失败，降级到本地缓存:', e.message);
             }
         }
-        // 降级到 localStorage
-        try {
-            const data = localStorage.getItem(key);
-            return data ? JSON.parse(data) : null;
-        } catch (_) { return null; }
+        const cached = await loadIndexedValue(key);
+        if (cached !== null && cached !== undefined) {
+            return cached;
+        }
+
+        const legacy = readLegacyLocalCache(key);
+        if (legacy !== null && legacy !== undefined) {
+            const saved = await saveIndexedValue(key, legacy);
+            if (saved) {
+                try {
+                    localStorage.removeItem(key);
+                } catch (_) { /* ignore */ }
+            }
+            return legacy;
+        }
+
+        return null;
     },
 
     async set(key, value) {
-        const config = loadConfig();
-        // 始终写入 localStorage（作为缓存）
+        const config = await ensureConfigHydrated();
+        await saveIndexedValue(key, value);
         try {
-            localStorage.setItem(key, JSON.stringify(value));
+            localStorage.removeItem(key);
         } catch (_) { /* ignore */ }
 
         if (config.useBackend) {
@@ -74,8 +121,12 @@ export const storage = {
     },
 
     async delete(key) {
-        localStorage.removeItem(key);
-        const config = loadConfig();
+        await deleteIndexedValue(key);
+        try {
+            localStorage.removeItem(key);
+        } catch (_) { /* ignore */ }
+
+        const config = await ensureConfigHydrated();
         if (config.useBackend) {
             try {
                 await fetch(`${config.backendUrl}/api/storage/${key}`, {
@@ -111,4 +162,4 @@ export const BACKEND_API_SPEC = {
     },
 };
 
-export default { loadConfig: () => loadConfig(), saveConfig, isBackendMode, storage, BACKEND_API_SPEC };
+export default { loadConfig, ensureConfigHydrated, saveConfig, isBackendMode, storage, BACKEND_API_SPEC };

@@ -2,21 +2,63 @@
  * MCP (Model Context Protocol) 客户端
  * 前端抽象层 — 通过 SSE/HTTP 连接 MCP Server
  */
+import { createPersistentResource } from '../utils/persistentResource.js';
 
 const STORAGE_KEY = 'agent-auto-mcp-servers';
+
+const mcpConfigResource = createPersistentResource({
+    storageKey: STORAGE_KEY,
+    initialValue: () => ([]),
+    bootstrapSelector: (configs) => (configs || []).map(config => ({
+        ...config,
+        authToken: '',
+    })),
+});
+
+function normalizeMCPConfigs(configs = []) {
+    return Array.isArray(configs)
+        ? configs.map(config => ({
+            ...config,
+            name: config?.name || config?.url || '',
+            url: config?.url || '',
+            authToken: config?.authToken || '',
+        }))
+        : [];
+}
 
 /**
  * MCP Server 连接配置
  */
 export function loadMCPConfigs() {
-    try {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        return saved ? JSON.parse(saved) : [];
-    } catch (_) { return []; }
+    return normalizeMCPConfigs(mcpConfigResource.get());
+}
+
+export async function ensureMCPConfigsHydrated() {
+    const hydrated = await mcpConfigResource.hydrate();
+    const normalized = normalizeMCPConfigs(hydrated);
+    mcpConfigResource.set(normalized);
+    return normalized;
 }
 
 export function saveMCPConfigs(configs) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(configs));
+    const normalized = normalizeMCPConfigs(configs);
+    mcpConfigResource.set(normalized);
+
+    const activeUrls = new Set(normalized.map(config => config.url));
+    for (const [serverUrl, client] of mcpClients.entries()) {
+        if (!activeUrls.has(serverUrl)) {
+            client.disconnect();
+            mcpClients.delete(serverUrl);
+        }
+    }
+
+    normalized.forEach(config => {
+        const client = mcpClients.get(config.url);
+        if (client) {
+            client.authToken = config.authToken || '';
+            client.name = config.name || config.url;
+        }
+    });
 }
 
 /**
@@ -91,11 +133,15 @@ export class MCPClient {
 /** 全局 MCP 客户端管理 */
 const mcpClients = new Map();
 
-export function getMCPClient(serverUrl) {
+export async function getMCPClient(serverUrl) {
+    const configs = await ensureMCPConfigsHydrated();
+    const config = configs.find(c => c.url === serverUrl) || {};
     if (!mcpClients.has(serverUrl)) {
-        const configs = loadMCPConfigs();
-        const config = configs.find(c => c.url === serverUrl) || {};
         mcpClients.set(serverUrl, new MCPClient(serverUrl, config));
+    } else {
+        const client = mcpClients.get(serverUrl);
+        client.authToken = config.authToken || '';
+        client.name = config.name || serverUrl;
     }
     return mcpClients.get(serverUrl);
 }
@@ -104,4 +150,4 @@ export function getAllMCPClients() {
     return Array.from(mcpClients.values());
 }
 
-export default { MCPClient, loadMCPConfigs, saveMCPConfigs, getMCPClient, getAllMCPClients };
+export default { MCPClient, loadMCPConfigs, ensureMCPConfigsHydrated, saveMCPConfigs, getMCPClient, getAllMCPClients };

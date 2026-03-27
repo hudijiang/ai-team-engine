@@ -3,8 +3,16 @@
  * 前端抽象层：定义多工作区和角色隔离的数据结构
  * 真正的实时同步需要后端 WebSocket 支持
  */
+import { createPersistentResource } from '../utils/persistentResource.js';
 
 const STORAGE_KEY = 'agent-auto-workspaces';
+
+const workspaceResource = createPersistentResource({
+    storageKey: STORAGE_KEY,
+    initialValue: () => ([]),
+});
+
+void workspaceResource.hydrate();
 
 /**
  * 工作区定义
@@ -22,14 +30,11 @@ const STORAGE_KEY = 'agent-auto-workspaces';
  * 加载所有工作区
  */
 export function loadWorkspaces() {
-    try {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        return saved ? JSON.parse(saved) : [];
-    } catch (_) { return []; }
+    return workspaceResource.get() || [];
 }
 
 export function saveWorkspaces(workspaces) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(workspaces));
+    workspaceResource.set(Array.isArray(workspaces) ? workspaces : []);
 }
 
 /**

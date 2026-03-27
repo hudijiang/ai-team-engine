@@ -2,6 +2,7 @@
  * 插件系统
  * 支持注册自定义角色模板和工具链
  */
+import { createPersistentResource } from '../utils/persistentResource.js';
 
 const STORAGE_KEY = 'agent-auto-plugins';
 
@@ -55,34 +56,38 @@ const BUILTIN_PLUGINS = [
     },
 ];
 
-/**
- * 加载所有插件（内置 + 自定义）
- */
-export function loadPlugins() {
-    let custom = [];
-    try {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) custom = JSON.parse(saved);
-    } catch (_) { /* ignore */ }
+const pluginResource = createPersistentResource({
+    storageKey: STORAGE_KEY,
+    initialValue: () => ([]),
+});
 
-    // 合并内置和自定义
-    const all = [...BUILTIN_PLUGINS];
-    for (const cp of custom) {
-        const idx = all.findIndex(p => p.id === cp.id);
+void pluginResource.hydrate();
+
+function mergePlugins(customPlugins = []) {
+    const all = BUILTIN_PLUGINS.map(plugin => ({ ...plugin }));
+    for (const plugin of customPlugins || []) {
+        const idx = all.findIndex(item => item.id === plugin.id);
         if (idx >= 0) {
-            all[idx] = { ...all[idx], ...cp };
+            all[idx] = { ...all[idx], ...plugin };
         } else {
-            all.push(cp);
+            all.push({ ...plugin });
         }
     }
     return all;
 }
 
 /**
+ * 加载所有插件（内置 + 自定义）
+ */
+export function loadPlugins() {
+    return mergePlugins(pluginResource.get());
+}
+
+/**
  * 保存插件状态
  */
 export function savePlugins(plugins) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(plugins));
+    pluginResource.set(Array.isArray(plugins) ? plugins : []);
 }
 
 /**

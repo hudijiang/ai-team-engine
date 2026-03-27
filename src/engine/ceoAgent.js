@@ -7,14 +7,22 @@ import {
     createStructuredMessage,
     AGENT_STATES,
     DIALOGUE_TEMPLATES,
-} from './agentEngine';
-import { decomposeWithLLM } from './taskDecomposer';
-import messageBus from './messageBus';
-import { sendChat, resolveProviderForModel } from './llmClient';
-import { loadProviderConfigs, PROVIDERS, fetchModelsFromAPI, getCachedModels } from './modelConfig';
+} from './agentEngine.js';
+import { decomposeWithLLM } from './taskDecomposer.js';
+import messageBus from './messageBus.js';
+import { sendChat, resolveProviderForModel } from './llmClient.js';
+import { ensureProviderConfigsHydrated, PROVIDERS, fetchModelsFromAPI, getCachedModels } from './modelConfig.js';
+import { parseToolCalls } from './toolRegistry.js';
+import {
+    loadExecutionCapabilities,
+    shouldUseToolLoop,
+    executeCapabilityTool,
+    summarizeToolCall,
+} from './capabilityRuntime.js';
 import { v4 as uuidv4 } from 'uuid';
-import { formatMemoryContext, saveMemory } from './agentMemory';
-import logger from '../utils/logger';
+import { formatMemoryContext, saveMemory } from './agentMemory.js';
+import performanceTracker from './performanceTracker.js';
+import logger from '../utils/logger.js';
 
 /**
  * CEO Agent 运行器
@@ -34,6 +42,7 @@ export class CEOAgentRunner {
         this._paused = false;
         this._pendingHumanInput = null;
         this._pendingExecution = null;
+        this._pendingDecisionResolve = null;
         this._pauseResolve = null;
     }
 
@@ -339,6 +348,13 @@ ${modelList}
         ], ['等待董事长配置模型', '确认后启动执行']);
 
         this.dispatch({ type: 'SET_STATUS', payload: 'waiting_for_config' });
+        this._setWorkflowCheckpoint({
+            type: 'waiting_for_config',
+            ceoAgentId: ceoAgent.id,
+            teamAgentIds: teamAgents.map(agent => agent.id),
+            decomposition,
+            createdAt: new Date().toISOString(),
+        });
 
         // 保存待执行数据，等待用户确认后调用 resume()
         this._pendingExecution = { ceoAgent, teamAgents, decomposition };
@@ -349,6 +365,9 @@ ${modelList}
      * 董事长确认模型配置后，恢复执行
      */
     async resume() {
+        if (!this._pendingExecution) {
+            this.restorePendingExecution();
+        }
         if (!this._pendingExecution) return;
         this._aborted = false;
         this.isRunning = true;
@@ -364,7 +383,7 @@ ${modelList}
         });
 
         // ✅ 前置检查：验证所有 Agent 的 API Key 是否已配置
-        const configs = loadProviderConfigs();
+        const configs = await ensureProviderConfigsHydrated();
         const missingConfigs = [];
         for (const agent of latestTeamAgents) {
             if (!agent.model) continue;
@@ -400,6 +419,7 @@ ${modelList}
         });
 
         this.dispatch({ type: 'SET_STATUS', payload: 'running' });
+        this._clearWorkflowCheckpoint();
 
         // 展示各成员选定的模型
         const modelLines = latestTeamAgents.map(a => {
@@ -426,7 +446,7 @@ ${modelList}
     /**
      * 驱动团队执行各阶段任务
      */
-    async _driveExecution(ceoAgent, teamAgents, decomposition) {
+    async _driveExecution(ceoAgent, teamAgents, decomposition, options = {}) {
         const tasks = decomposition.tasks;
         const validation = this._validateTasks(tasks);
         if (!validation.ok) {
@@ -447,7 +467,7 @@ ${modelList}
             return;
         }
 
-        const completedPhases = new Set();
+        const completedPhases = new Set(options.completedPhases || []);
         let noProgressTicks = 0;
         const MAX_IDLE_TICKS = 40;
 
@@ -473,7 +493,7 @@ ${modelList}
                 const execPromises = readyTasks.map(async (task) => {
                     const agent = teamAgents.find(a => a.name === task.assignee);
                     if (!agent) return;
-                    await this._executeAgentPhase(ceoAgent, agent, task, completedPhases);
+                    await this._executeAgentPhase(ceoAgent, agent, task, completedPhases, teamAgents);
                     completedPhases.add(task.phase);
                 });
 
@@ -606,11 +626,66 @@ ${modelList}
         logger.info('CEO', `项目完成：「${decomposition.objective}」，共 ${tasks.length} 阶段`);
     }
 
+    hasPendingExecution() {
+        return !!this._pendingExecution;
+    }
+
+    restorePendingExecution(checkpoint = null) {
+        const savedCheckpoint = checkpoint || this.getState().workflowCheckpoint;
+        if (!savedCheckpoint || savedCheckpoint.type !== 'waiting_for_config') {
+            return false;
+        }
+
+        const context = this._restoreCheckpointContext(savedCheckpoint);
+        if (!context) return false;
+        const { ceoAgent, teamAgents, decomposition } = context;
+
+        this._aborted = false;
+        this._paused = false;
+        this._pendingExecution = { ceoAgent, teamAgents, decomposition };
+        return true;
+    }
+
+    _setWorkflowCheckpoint(payload) {
+        this.dispatch({ type: 'SET_WORKFLOW_CHECKPOINT', payload });
+    }
+
+    _clearWorkflowCheckpoint() {
+        this.dispatch({ type: 'CLEAR_WORKFLOW_CHECKPOINT' });
+    }
+
+    _restoreCheckpointContext(checkpoint = null) {
+        const state = this.getState();
+        const savedCheckpoint = checkpoint || state.workflowCheckpoint;
+        if (!savedCheckpoint) return null;
+
+        const ceoAgent = state.agents.find(a => a.id === savedCheckpoint.ceoAgentId)
+            || state.agents.find(a => a.name === 'CEO');
+        const decomposition = savedCheckpoint.decomposition || state.decomposition;
+        const teamAgents = (savedCheckpoint.teamAgentIds || [])
+            .map(agentId => state.agents.find(agent => agent.id === agentId))
+            .filter(Boolean);
+
+        if (!ceoAgent || !decomposition || teamAgents.length === 0) {
+            return null;
+        }
+
+        return {
+            state,
+            ceoAgent,
+            decomposition,
+            teamAgents,
+            completedPhases: new Set(savedCheckpoint.completedPhases || []),
+            checkpoint: savedCheckpoint,
+        };
+    }
+
     /**
      * 执行单个 Agent 的任务阶段
      */
-    async _executeAgentPhase(ceoAgent, agent, task, completedPhases) {
+    async _executeAgentPhase(ceoAgent, agent, task, completedPhases, teamAgents) {
         const agentId = agent.id;
+        const phaseStartedAt = new Date().toISOString();
 
         // 检查前置等待
         if (task.dependencies.length > 0) {
@@ -645,8 +720,15 @@ ${modelList}
         );
         await this._delay(1500);
 
-        // 执行子任务（使用升级后的 _executeSubtask）
-        for (let i = 0; i < task.subtasks.length; i++) {
+        const success = await this._runRemainingSubtasks(ceoAgent, agent, task, completedPhases, teamAgents, 0, phaseStartedAt);
+        if (!success || this._aborted) return;
+
+        await this._finalizeAgentPhase(ceoAgent, agent, task, completedPhases, teamAgents, phaseStartedAt);
+    }
+
+    async _runRemainingSubtasks(ceoAgent, agent, task, completedPhases, teamAgents, startIndex = 0, phaseStartedAt = new Date().toISOString()) {
+        const agentId = agent.id;
+        for (let i = startIndex; i < task.subtasks.length; i++) {
             const subtask = task.subtasks[i];
             const subtaskProgress = (i + 1) / task.subtasks.length;
 
@@ -682,7 +764,7 @@ ${modelList}
                 type: 'UPDATE_AGENT_OUTPUTS',
                 payload: {
                     id: agentId,
-                    output: { subtask, content: result.content, source: result.source },
+                    output: { phase: task.phase, subtask, content: result.content, source: result.source },
                 },
             });
 
@@ -700,7 +782,17 @@ ${modelList}
             // 使用 LLM 智能判断是否需要董事长人工介入
             const needsHumanIntervention = await this._checkHumanInterventionNeeded(agent, subtask);
             if (needsHumanIntervention) {
-                const humanResult = await this._requestHumanIntervention(agent, subtask);
+                const humanResult = await this._requestHumanIntervention(agent, subtask, {
+                    ceoAgentId: ceoAgent.id,
+                    teamAgentIds: teamAgents.map(teamAgent => teamAgent.id),
+                    decomposition: this.getState().decomposition || null,
+                    completedPhases: [...completedPhases],
+                    currentPhase: task.phase,
+                    currentAgentId: agent.id,
+                    currentSubtaskIndex: i,
+                    currentSubtask: subtask,
+                    phaseStartedAt,
+                });
                 if (humanResult === 'TIMEOUT_ABORT') return;
             }
 
@@ -712,6 +804,12 @@ ${modelList}
                 []
             );
         }
+
+        return true;
+    }
+
+    async _finalizeAgentPhase(ceoAgent, agent, task, completedPhases, teamAgents, phaseStartedAt = new Date().toISOString()) {
+        const agentId = agent.id;
 
         // 审核阶段
         this.dispatch({
@@ -729,6 +827,9 @@ ${modelList}
         );
         await this._delay(1500);
 
+        const qaReview = await this._runPhaseQualityGate(ceoAgent, agent, task);
+        const phaseContent = qaReview.finalContent || this._buildPhaseOutput(agent, task);
+
         // 标记完成
         this.dispatch({
             type: 'UPDATE_AGENT',
@@ -744,9 +845,15 @@ ${modelList}
             []
         );
 
+        this._recordPhasePerformance(agent, task, phaseStartedAt, qaReview, phaseContent);
+
         // CEO 确认
+        const qaBadge = qaReview.result === 'pass'
+            ? 'QA 通过'
+            : `QA 待继续优化${qaReview.suggestion ? `：${qaReview.suggestion}` : ''}`;
         this._emitCEOMessage(ceoAgent, [
             `【CEO】收到 ${agent.name} 报告：「${task.phase}」阶段已完成 ✅`,
+            `质量结论：${qaBadge}`,
         ], []);
 
         // ★ 阶段完成后，与下游依赖的 Agent 进行多轮协作共识
@@ -758,7 +865,13 @@ ${modelList}
         for (const downTask of downstreamTasks) {
             const downAgent = state.agents.find(a => a.name === downTask.assignee);
             if (!downAgent || downAgent.id === agentId) continue;
-            await this._conductCollaboration(ceoAgent, agent, downAgent, task.phase, 3);
+            await this._conductCollaboration(ceoAgent, agent, downAgent, task.phase, 3, {
+                ceoAgentId: ceoAgent.id,
+                teamAgentIds: teamAgents.map(teamAgent => teamAgent.id),
+                decomposition: state.decomposition || null,
+                completedPhases: [...completedPhases],
+                currentPhase: task.phase,
+            });
             if (this._aborted) return;
         }
 
@@ -768,7 +881,7 @@ ${modelList}
     /**
      * 等待董事长的人工协助（如扫码/验证码等）
      */
-    async _requestHumanIntervention(agent, currentSubtask) {
+    async _requestHumanIntervention(agent, currentSubtask, checkpointPayload = null) {
         return new Promise(resolve => {
             this._pendingHumanInput = resolve;
 
@@ -794,6 +907,13 @@ ${modelList}
             });
 
             this.dispatch({ type: 'SET_STATUS', payload: 'waiting_for_human' });
+            if (checkpointPayload) {
+                this._setWorkflowCheckpoint({
+                    type: 'waiting_for_human',
+                    ...checkpointPayload,
+                    createdAt: new Date().toISOString(),
+                });
+            }
 
             this._emitCEOMessage(ceoAgent, [
                 `【CEO】🚨 遇到需要董事长协助的步骤！`,
@@ -825,6 +945,7 @@ ${modelList}
             const ceoAgent = state.agents.find(a => a.name === 'CEO');
 
             this.dispatch({ type: 'SET_STATUS', payload: 'running' });
+            this._clearWorkflowCheckpoint();
 
             this.dispatch({
                 type: 'UPDATE_AGENT',
@@ -841,6 +962,12 @@ ${modelList}
             ], ['继续调度后续阶段']);
 
             resolve(input);
+            return;
+        }
+
+        const checkpoint = this.getState().workflowCheckpoint;
+        if (checkpoint?.type === 'waiting_for_human') {
+            void this._resumeAfterHumanIntervention(checkpoint, input, { skipped: false });
         }
     }
 
@@ -856,6 +983,7 @@ ${modelList}
             const ceoAgent = state.agents.find(a => a.name === 'CEO');
 
             this.dispatch({ type: 'SET_STATUS', payload: 'running' });
+            this._clearWorkflowCheckpoint();
             this.dispatch({
                 type: 'UPDATE_AGENT',
                 payload: {
@@ -870,7 +998,126 @@ ${modelList}
             ], []);
 
             resolve(reason);
+            return;
         }
+
+        const checkpoint = this.getState().workflowCheckpoint;
+        if (checkpoint?.type === 'waiting_for_human') {
+            void this._resumeAfterHumanIntervention(checkpoint, reason, { skipped: true });
+        }
+    }
+
+    async _resumeAfterHumanIntervention(checkpoint, input, { skipped = false } = {}) {
+        const context = this._restoreCheckpointContext(checkpoint);
+        const state = this.getState();
+        const ceoAgent = context?.ceoAgent || state.agents.find(a => a.name === 'CEO');
+        const failRecovery = (reason) => {
+            this._clearWorkflowCheckpoint();
+            this.dispatch({ type: 'SET_STATUS', payload: 'blocked' });
+            if (ceoAgent) {
+                this.dispatch({
+                    type: 'UPDATE_AGENT',
+                    payload: {
+                        id: ceoAgent.id,
+                        state: AGENT_STATES.BLOCKED,
+                        currentTask: '人工协助恢复失败',
+                    },
+                });
+                this._emitCEOMessage(ceoAgent, [
+                    `【CEO】⚠️ ${reason}`,
+                    '请重新发布目标启动新的执行流程。',
+                ], ['重新发布目标']);
+            }
+            this.isRunning = false;
+        };
+
+        if (!context) {
+            failRecovery('未找到可恢复的人工协助上下文。');
+            return;
+        }
+
+        const { decomposition, teamAgents, completedPhases } = context;
+        const agent = state.agents.find(a => a.id === checkpoint.currentAgentId);
+        const task = decomposition.tasks.find(t => t.phase === checkpoint.currentPhase);
+        const interruptedSubtask = checkpoint.currentSubtask || task?.subtasks?.[checkpoint.currentSubtaskIndex];
+
+        if (!agent || !task || !interruptedSubtask) {
+            failRecovery('人工协助恢复时缺少必要的阶段信息。');
+            return;
+        }
+
+        this._aborted = false;
+        this._paused = false;
+        this.isRunning = true;
+        this.dispatch({ type: 'SET_STATUS', payload: 'running' });
+        this._clearWorkflowCheckpoint();
+
+        this.dispatch({
+            type: 'UPDATE_AGENT',
+            payload: {
+                id: ceoAgent.id,
+                state: AGENT_STATES.EXECUTING,
+                currentTask: skipped ? '跳过人工步骤，继续执行' : '协调协作，驱动执行',
+            },
+        });
+        this.dispatch({
+            type: 'UPDATE_AGENT',
+            payload: {
+                id: agent.id,
+                state: AGENT_STATES.EXECUTING,
+                currentTask: interruptedSubtask,
+                currentSubtaskIndex: checkpoint.currentSubtaskIndex,
+            },
+        });
+
+        this._emitCEOMessage(ceoAgent, [
+            skipped
+                ? `【CEO】已按董事长指示跳过当前人工协助步骤（原因：${input}），继续执行。`
+                : `【CEO】✅ 已收到董事长的协助输入：「${input}」`,
+            skipped ? '正在从中断点恢复执行。' : '通知团队恢复执行！',
+        ], ['继续调度后续阶段']);
+
+        await this._delay(300);
+        if (this._aborted) {
+            this.isRunning = false;
+            return;
+        }
+
+        this._emitAgentMessage(agent,
+            DIALOGUE_TEMPLATES.subtaskComplete(agent.name, interruptedSubtask),
+            []
+        );
+
+        const success = await this._runRemainingSubtasks(
+            ceoAgent,
+            agent,
+            task,
+            completedPhases,
+            teamAgents,
+            (checkpoint.currentSubtaskIndex ?? 0) + 1,
+            checkpoint.phaseStartedAt || new Date().toISOString()
+        );
+        if (!success || this._aborted) {
+            this.isRunning = false;
+            return;
+        }
+
+        await this._finalizeAgentPhase(
+            ceoAgent,
+            agent,
+            task,
+            completedPhases,
+            teamAgents,
+            checkpoint.phaseStartedAt || new Date().toISOString()
+        );
+        if (this._aborted) {
+            this.isRunning = false;
+            return;
+        }
+
+        completedPhases.add(task.phase);
+        await this._driveExecution(ceoAgent, teamAgents, decomposition, { completedPhases });
+        this.isRunning = false;
     }
 
     /**
@@ -943,6 +1190,9 @@ ${modelList}
         // 构建会话上下文
         const sessionContext = this._buildSessionContext();
         const currentObjective = state.currentObjective || '';
+        const capabilityQuery = [currentObjective, subtask, prevOutputs].filter(Boolean).join('\n');
+        const capabilities = await loadExecutionCapabilities(capabilityQuery);
+        const toolLoopEnabled = shouldUseToolLoop(`${currentObjective}\n${subtask}`, capabilities);
 
         // 注入 Agent 记忆上下文
         const memoryContext = formatMemoryContext(agent.name);
@@ -951,7 +1201,9 @@ ${modelList}
             `你是团队成员「${agent.name}」，角色：${agent.role}。`,
             `当前项目目标：「${currentObjective}」`,
             sessionContext ? `\n### 项目背景与上下文\n${sessionContext}\n` : '',
+            capabilities.ragContext,
             memoryContext,
+            toolLoopEnabled ? capabilities.toolPrompt : '',
             '你正在执行一个具体的工作子任务。请直接输出实质性工作成果。',
             '要求：Markdown 格式，200-500 字中文，具体可用，不是概述。',
             '重要：请结合以上项目背景和上下文来理解当前任务，不要脱离上下文给出泛泛的通用回答。',
@@ -965,33 +1217,32 @@ ${modelList}
         ].join('\n');
 
         try {
-            const content = await this._callLLMWithRetry({
-                model: agent.model || state.defaultModel || '',
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userPrompt },
-                ],
-                availableModels,
-                stream: true,
-                onToken: (t) => onStream && onStream(t),
-            });
-
-            if (content) {
-                const lines = content.split('\n').filter(Boolean);
-                const summaryLines = [
-                    `【${agent.name}】已完成：${subtask}`,
-                    lines[0] ? `📄 ${lines[0].replace(/^#+\s*/, '').slice(0, 80)}...` : '',
-                ].filter(Boolean);
-
-                this.dispatch({
-                    type: 'UPDATE_AGENT_HISTORY',
-                    payload: {
-                        id: agent.id,
-                        entry: { role: 'assistant', content: `[${subtask}] ${content.slice(0, 300)}` },
-                    },
+            const model = agent.model || state.defaultModel || '';
+            const baseMessages = [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt },
+            ];
+            const content = toolLoopEnabled
+                ? await this._runToolAssistedSubtask(agent, {
+                    model,
+                    availableModels,
+                    messages: baseMessages,
+                    userPrompt,
+                    subtask,
+                    capabilities,
+                }, onStream)
+                : await this._callLLMWithRetry({
+                    model,
+                    messages: baseMessages,
+                    availableModels,
+                    agentName: agent.name,
+                    dispatch: this.dispatch,
+                    stream: true,
+                    onToken: (t) => onStream && onStream(t),
                 });
 
-                return { summary: summaryLines, content, source: 'llm' };
+            if (content) {
+                return this._buildSubtaskResult(agent, subtask, content, 'llm');
             }
         } catch (e) {
             logger.warn('LLM', `子任务执行失败：${subtask} - ${e.message}`);
@@ -1001,9 +1252,264 @@ ${modelList}
         return { summary: fallbackLines, content: fallbackLines.join('\n'), source: 'template' };
     }
 
+    _buildSubtaskResult(agent, subtask, content, source = 'llm') {
+        const lines = content.split('\n').filter(Boolean);
+        const summaryLines = [
+            `【${agent.name}】已完成：${subtask}`,
+            lines[0] ? `📄 ${lines[0].replace(/^#+\s*/, '').slice(0, 80)}...` : '',
+        ].filter(Boolean);
+
+        this.dispatch({
+            type: 'UPDATE_AGENT_HISTORY',
+            payload: {
+                id: agent.id,
+                entry: { role: 'assistant', content: `[${subtask}] ${content.slice(0, 300)}` },
+            },
+        });
+
+        return { summary: summaryLines, content, source };
+    }
+
+    async _runToolAssistedSubtask(agent, request, onStream) {
+        const initialResponse = await this._callLLMWithRetry({
+            model: request.model,
+            messages: request.messages,
+            availableModels: request.availableModels,
+            agentName: agent.name,
+            dispatch: this.dispatch,
+        });
+        const toolCalls = parseToolCalls(initialResponse || '').slice(0, 3);
+        if (toolCalls.length === 0) {
+            return initialResponse;
+        }
+
+        const toolBlocks = [];
+        for (const call of toolCalls) {
+            const toolLabel = summarizeToolCall(call.tool, call.params || {});
+            this._emitAgentMessage(agent, [
+                `【${agent.name}】调用工具：${toolLabel}`,
+            ], [], 'tool_call');
+
+            const toolResult = await executeCapabilityTool(
+                request.capabilities.toolMap,
+                call.tool,
+                call.params || {}
+            );
+            const preview = toolResult.length > 240 ? `${toolResult.slice(0, 240)}...` : toolResult;
+            this._emitAgentMessage(agent, [
+                `【工具结果】${call.tool}`,
+                preview,
+            ], [], 'tool_call');
+
+            toolBlocks.push([
+                `工具：${call.tool}`,
+                `参数：${JSON.stringify(call.params || {})}`,
+                `结果：\n${toolResult}`,
+            ].join('\n'));
+        }
+
+        const finalSystemPrompt = [
+            request.messages[0].content,
+            '你已经拿到工具返回结果。现在请直接输出最终工作成果，不要再输出 tool_call 代码块。',
+        ].join('\n');
+        const finalUserPrompt = [
+            request.userPrompt,
+            '',
+            '以下是工具返回结果：',
+            ...toolBlocks.map((block, index) => `### 工具结果 ${index + 1}\n${block}`),
+            '',
+            '请基于这些结果直接输出最终工作成果。',
+        ].join('\n');
+
+        return await this._callLLMWithRetry({
+            model: request.model,
+            messages: [
+                { role: 'system', content: finalSystemPrompt },
+                { role: 'user', content: finalUserPrompt },
+            ],
+            availableModels: request.availableModels,
+            agentName: agent.name,
+            dispatch: this.dispatch,
+            stream: true,
+            onToken: (t) => onStream && onStream(t),
+        });
+    }
+
+    _getPhaseOutputs(agent, task) {
+        const latestAgent = this._getLatestAgent(agent.id) || agent;
+        const outputs = latestAgent.outputs || [];
+        return outputs.filter(output =>
+            output.phase === task.phase || task.subtasks.includes(output.subtask)
+        );
+    }
+
+    _buildPhaseOutput(agent, task) {
+        const outputs = this._getPhaseOutputs(agent, task);
+        if (outputs.length === 0) return '';
+
+        return outputs
+            .map((output, index) => {
+                const title = output.subtask || `${task.phase}-${index + 1}`;
+                return `### ${title}\n${output.content || '（空）'}`;
+            })
+            .join('\n\n')
+            .trim();
+    }
+
+    _collectPhaseMetrics(agentName, phaseStartedAt) {
+        const phaseStart = Date.parse(phaseStartedAt || '') || 0;
+        const promptLogs = this.getState().promptLogs || [];
+        const relevantLogs = promptLogs.filter(log => {
+            if (log.agentName !== agentName) return false;
+            const logTime = Date.parse(log.timestamp || '') || 0;
+            return logTime >= phaseStart;
+        });
+
+        return relevantLogs.reduce((acc, log) => ({
+            durationMs: acc.durationMs + (log.durationMs || 0),
+            tokenCount: acc.tokenCount + (log.totalTokens || 0),
+        }), { durationMs: 0, tokenCount: 0 });
+    }
+
+    _recordPhasePerformance(agent, task, phaseStartedAt, qaReview, phaseContent) {
+        const state = this.getState();
+        const metrics = this._collectPhaseMetrics(agent.name, phaseStartedAt);
+
+        performanceTracker.record({
+            agentName: agent.name,
+            taskName: task.phase,
+            durationMs: metrics.durationMs,
+            tokenCount: metrics.tokenCount,
+            outputLength: (phaseContent || '').length,
+            qaResult: qaReview?.result || 'pass',
+            sessionId: state.currentSessionId || logger.getSessionId() || '',
+        });
+    }
+
+    async _runPhaseQualityGate(ceoAgent, agent, task) {
+        const phaseOutput = this._buildPhaseOutput(agent, task);
+        if (!phaseOutput) {
+            return { result: 'pass', suggestion: '', finalContent: '', revised: false };
+        }
+
+        this._emitCEOMessage(ceoAgent, [
+            `【CEO】🧪 正在对「${task.phase}」进行质量审核`,
+        ], []);
+
+        const firstReview = await this._qualityReview(agent, task.phase, phaseOutput);
+        if (firstReview.result === 'pass') {
+            this._emitCEOMessage(ceoAgent, [
+                `【CEO】✅ 「${task.phase}」质量审核通过`,
+            ], []);
+            return { ...firstReview, finalContent: phaseOutput, revised: false };
+        }
+
+        this._emitCEOMessage(ceoAgent, [
+            `【CEO】🛠 「${task.phase}」首轮审核未通过`,
+            firstReview.suggestion
+                ? `修改建议：${firstReview.suggestion}`
+                : '当前产出还不够具体或不够贴合任务，已要求修订。',
+        ], []);
+
+        const revisedContent = await this._revisePhaseOutput(agent, task, phaseOutput, firstReview.suggestion);
+        const secondReview = await this._qualityReview(agent, `${task.phase}（修订版）`, revisedContent);
+        if (secondReview.result === 'pass') {
+            this._emitCEOMessage(ceoAgent, [
+                `【CEO】✅ 「${task.phase}」修订后审核通过`,
+            ], []);
+        } else {
+            this._emitCEOMessage(ceoAgent, [
+                `【CEO】⚠️ 「${task.phase}」修订后仍有改进空间`,
+                secondReview.suggestion
+                    ? `保留建议：${secondReview.suggestion}`
+                    : '本轮先保留现有修订结果，建议后续继续优化。',
+            ], []);
+        }
+
+        return {
+            result: secondReview.result,
+            suggestion: secondReview.suggestion || firstReview.suggestion || '',
+            finalContent: revisedContent,
+            revised: true,
+        };
+    }
+
+    async _revisePhaseOutput(agent, task, phaseOutput, suggestion = '') {
+        const state = this.getState();
+        const availableModels = state.availableModels;
+        const currentObjective = state.currentObjective || '';
+        const sessionContext = this._buildSessionContext();
+        const memoryContext = formatMemoryContext(agent.name);
+
+        const systemPrompt = [
+            `你是团队成员「${agent.name}」，角色：${agent.role}。`,
+            `当前项目目标：「${currentObjective}」`,
+            sessionContext ? `\n### 项目背景与上下文\n${sessionContext}\n` : '',
+            memoryContext,
+            '请根据 QA 意见修订当前阶段成果，输出一份更具体、更可执行的阶段稿。',
+        ].filter(Boolean).join('\n');
+
+        const userPrompt = [
+            `当前阶段：「${task.phase}」`,
+            `原始阶段成果：\n${phaseOutput.slice(0, 2000)}`,
+            suggestion ? `\nQA 修改建议：${suggestion}` : '',
+            '\n请直接输出修订后的阶段成果，使用 Markdown，300-800 字中文，避免空话。',
+        ].join('\n');
+
+        try {
+            const revisedContent = await this._callLLMWithRetry({
+                model: agent.model || state.defaultModel || '',
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt },
+                ],
+                availableModels,
+                agentName: agent.name,
+                dispatch: this.dispatch,
+            });
+
+            if (!revisedContent) {
+                return phaseOutput;
+            }
+
+            this.dispatch({
+                type: 'UPDATE_AGENT_OUTPUTS',
+                payload: {
+                    id: agent.id,
+                    output: {
+                        phase: task.phase,
+                        subtask: `${task.phase}（QA修订版）`,
+                        content: revisedContent,
+                        source: 'qa-revision',
+                    },
+                },
+            });
+            this.dispatch({
+                type: 'UPDATE_AGENT_HISTORY',
+                payload: {
+                    id: agent.id,
+                    entry: { role: 'assistant', content: `[${task.phase} QA修订] ${revisedContent.slice(0, 300)}` },
+                },
+            });
+            this._emitAgentMessage(
+                agent,
+                [`【${agent.name}】已根据 QA 建议完成「${task.phase}」修订。`],
+                ['等待 CEO 复审'],
+                'qa-review',
+                null,
+                revisedContent
+            );
+
+            return revisedContent;
+        } catch (e) {
+            logger.warn('QA', `阶段修订失败：${task.phase} - ${e.message}`);
+            return phaseOutput;
+        }
+    }
+
     /**
      * 质量自动审核 (QA Self-Review)
-     * @returns {'pass'|'revise'} 审核结果
+     * @returns {{result: 'pass'|'revise', suggestion: string}} 审核结果
      */
     async _qualityReview(agent, task, outputContent) {
         try {
@@ -1023,29 +1529,32 @@ ${modelList}
                 `\n只回复 JSON：{"result": "pass"} 或 {"result": "revise", "suggestion": "具体修改建议"}`,
             ].join('\n');
 
-            const response = await sendChat({
+            const response = await this._callLLMWithRetry({
                 model: ceoAgent?.model || '',
                 messages: [{ role: 'user', content: prompt }],
                 availableModels,
                 agentName: 'QA-Review',
                 dispatch: this.dispatch,
-            });
+            }, 2);
 
             const jsonMatch = response.match(/\{[\s\S]*?\}/);
             if (jsonMatch) {
                 const parsed = JSON.parse(jsonMatch[0]);
-                return parsed.result === 'pass' ? 'pass' : 'revise';
+                return {
+                    result: parsed.result === 'pass' ? 'pass' : 'revise',
+                    suggestion: typeof parsed.suggestion === 'string' ? parsed.suggestion.trim() : '',
+                };
             }
         } catch (e) {
             logger.warn('QA', `质量审核异常：${e.message}`);
         }
-        return 'pass'; // 审核失败默认通过
+        return { result: 'pass', suggestion: '' }; // 审核失败默认通过
     }
 
     /**
      * 多轮协作对话 + 共识判定
      */
-    async _conductCollaboration(ceoAgent, agentA, agentB, topic, maxRounds = 3) {
+    async _conductCollaboration(ceoAgent, agentA, agentB, topic, maxRounds = 3, executionContext = {}) {
         const state = this.getState();
         const availableModels = state.availableModels;
         const latestA = this._getLatestAgent(agentA.id) || agentA;
@@ -1144,7 +1653,7 @@ ${modelList}
         }
 
         // 超过最大轮次 -> 上报分歧
-        await this._escalateDisagreement(ceoAgent, agentA, agentB, topic, dialogueHistory);
+        await this._escalateDisagreement(ceoAgent, agentA, agentB, topic, dialogueHistory, executionContext);
     }
 
     /**
@@ -1177,7 +1686,7 @@ ${modelList}
     /**
      * 分歧上报：暂停执行，多方案供董事长决策
      */
-    async _escalateDisagreement(ceoAgent, agentA, agentB, topic, dialogueHistory) {
+    async _escalateDisagreement(ceoAgent, agentA, agentB, topic, dialogueHistory, executionContext = {}) {
         const state = this.getState();
         const availableModels = state.availableModels;
 
@@ -1218,6 +1727,18 @@ ${modelList}
             payload: { topic, agentA: agentA.name, agentB: agentB.name, summary, proposals, dialogueHistory },
         });
         this.dispatch({ type: 'SET_STATUS', payload: 'waiting_for_decision' });
+        this._setWorkflowCheckpoint({
+            type: 'waiting_for_decision',
+            ceoAgentId: executionContext.ceoAgentId || ceoAgent.id,
+            teamAgentIds: executionContext.teamAgentIds || [],
+            decomposition: executionContext.decomposition || this.getState().decomposition || null,
+            completedPhases: executionContext.completedPhases || [],
+            currentPhase: executionContext.currentPhase || topic,
+            agentAId: agentA.id,
+            agentBId: agentB.id,
+            topic,
+            createdAt: new Date().toISOString(),
+        });
 
         // 挂起等待董事长决策
         await new Promise(resolve => {
@@ -1235,9 +1756,16 @@ ${modelList}
         if (!decision) return;
 
         const chosenText = customInput || decision.proposals[proposalIndex]?.title || `方案 ${proposalIndex + 1}`;
+        const checkpoint = state.workflowCheckpoint;
+
+        if (!this._pendingDecisionResolve && checkpoint?.type === 'waiting_for_decision') {
+            void this._resumeAfterDecision(checkpoint, chosenText);
+            return;
+        }
 
         this.dispatch({ type: 'SET_STATUS', payload: 'running' });
         this.dispatch({ type: 'RESOLVE_DECISION' });
+        this._clearWorkflowCheckpoint();
 
         this._emitCEOMessage(ceoAgent, [
             `【CEO】✅ 董事长已做出决策：「${chosenText}」`,
@@ -1254,6 +1782,79 @@ ${modelList}
             this._pendingDecisionResolve();
             this._pendingDecisionResolve = null;
         }
+    }
+
+    async _resumeAfterDecision(checkpoint, chosenText) {
+        const context = this._restoreCheckpointContext(checkpoint);
+        const state = this.getState();
+        const ceoAgent = context?.ceoAgent || state.agents.find(a => a.name === 'CEO');
+        const failRecovery = (reason) => {
+            this._clearWorkflowCheckpoint();
+            this.dispatch({ type: 'RESOLVE_DECISION' });
+            this.dispatch({ type: 'SET_STATUS', payload: 'blocked' });
+            if (ceoAgent) {
+                this.dispatch({
+                    type: 'UPDATE_AGENT',
+                    payload: {
+                        id: ceoAgent.id,
+                        state: AGENT_STATES.BLOCKED,
+                        currentTask: '董事长决策恢复失败',
+                    },
+                });
+                this._emitCEOMessage(ceoAgent, [
+                    `【CEO】⚠️ ${reason}`,
+                    '请重新发布目标启动新的执行流程。',
+                ], ['重新发布目标']);
+            }
+            this.isRunning = false;
+        };
+
+        if (!context) {
+            failRecovery('未找到可恢复的董事长决策上下文。');
+            return;
+        }
+
+        const { decomposition, teamAgents, completedPhases } = context;
+        const decision = state.pendingDecision;
+        this._aborted = false;
+        this._paused = false;
+        this.isRunning = true;
+        this.dispatch({ type: 'SET_STATUS', payload: 'running' });
+        this.dispatch({ type: 'RESOLVE_DECISION' });
+        this._clearWorkflowCheckpoint();
+
+        this.dispatch({
+            type: 'UPDATE_AGENT',
+            payload: {
+                id: ceoAgent.id,
+                state: AGENT_STATES.EXECUTING,
+                currentTask: '根据董事长决策恢复执行',
+            },
+        });
+
+        this._emitCEOMessage(ceoAgent, [
+            `【CEO】✅ 董事长已做出决策：「${chosenText}」`,
+            '按此方案继续执行后续阶段。',
+        ], ['恢复执行流程']);
+
+        const entry = { role: 'system', content: `[董事长决策] ${decision?.topic || checkpoint.topic}: ${chosenText}` };
+        const aAgent = state.agents.find(a => a.id === checkpoint.agentAId || a.name === decision?.agentA);
+        const bAgent = state.agents.find(a => a.id === checkpoint.agentBId || a.name === decision?.agentB);
+        if (aAgent) this.dispatch({ type: 'UPDATE_AGENT_HISTORY', payload: { id: aAgent.id, entry } });
+        if (bAgent) this.dispatch({ type: 'UPDATE_AGENT_HISTORY', payload: { id: bAgent.id, entry } });
+
+        if (checkpoint.currentPhase) {
+            completedPhases.add(checkpoint.currentPhase);
+        }
+
+        await this._delay(300);
+        if (this._aborted) {
+            this.isRunning = false;
+            return;
+        }
+
+        await this._driveExecution(ceoAgent, teamAgents, decomposition, { completedPhases });
+        this.isRunning = false;
     }
 
     /**
@@ -1568,6 +2169,8 @@ ${modelList}
         this.timers = [];
         this._pendingExecution = null;
         this._pendingHumanInput = null;
+        this._pendingDecisionResolve = null;
+        this._pauseResolve = null;
     }
 }
 

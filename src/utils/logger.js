@@ -8,6 +8,7 @@ const LOG_BUFFER = [];
 const FLUSH_INTERVAL = 2000;
 let flushTimer = null;
 let currentSessionId = null;
+const isDevRuntime = typeof import.meta !== 'undefined' && !!import.meta.env?.DEV;
 
 /**
  * 刷写缓冲区到服务端
@@ -55,7 +56,7 @@ function log(level, tag, message) {
     consoleFn(`[${tag}]`, message);
 
     // 开发环境下缓冲写文件
-    if (import.meta.env.DEV) {
+    if (isDevRuntime) {
         LOG_BUFFER.push(entry);
         ensureTimer();
     }

@@ -3,10 +3,14 @@
  * 管理 Agents、消息、系统状态
  */
 import { create } from 'zustand';
-import { createAgent, AGENT_STATES } from '../engine/agentEngine';
-import logger from '../utils/logger';
+import { createAgent, AGENT_STATES } from '../engine/agentEngine.js';
+import logger from '../utils/logger.js';
+import { loadIndexedValue, saveIndexedValue } from '../utils/indexedDBStorage.js';
+import { sanitizeLoadedState } from './storeRecovery.js';
 
 const STORAGE_KEY = 'agent-auto-state';
+const FULL_STATE_STORAGE_KEY = 'state:full';
+let mutationVersion = 0;
 
 /**
  * 状态 Reducer
@@ -71,6 +75,8 @@ function agentReducer(state, action) {
                 currentObjective: action.payload,
                 systemStatus: 'running',
                 currentSessionId: sessionId,
+                pendingDecision: null,
+                workflowCheckpoint: null,
             };
         }
 
@@ -113,6 +119,14 @@ function agentReducer(state, action) {
 
         case 'RESOLVE_DECISION': {
             return { ...state, pendingDecision: null };
+        }
+
+        case 'SET_WORKFLOW_CHECKPOINT': {
+            return { ...state, workflowCheckpoint: action.payload };
+        }
+
+        case 'CLEAR_WORKFLOW_CHECKPOINT': {
+            return { ...state, workflowCheckpoint: null };
         }
 
         case 'UPDATE_AGENT_OUTPUTS': {
@@ -207,6 +221,7 @@ function agentReducer(state, action) {
                 currentSessionId: target.sessionId,
                 systemStatus: 'completed',
                 pendingDecision: null,
+                workflowCheckpoint: null,
                 systemLog: [],
                 sessionHistory: [...remainingHistory, ...currentArchive],
             };
@@ -241,6 +256,7 @@ function pickPersistable(state) {
         inbox: state.inbox,
         deliverables: state.deliverables,
         pendingDecision: state.pendingDecision,
+        workflowCheckpoint: state.workflowCheckpoint,
         currentObjective: state.currentObjective,
         currentSessionId: state.currentSessionId,
         sessionHistory: state.sessionHistory,
@@ -253,15 +269,34 @@ function pickPersistable(state) {
     };
 }
 
+function pickBootstrapPersistable(state) {
+    return {
+        agents: state.agents,
+        messages: (state.messages || []).slice(-50),
+        inbox: state.inbox,
+        deliverables: state.deliverables,
+        pendingDecision: state.pendingDecision,
+        workflowCheckpoint: state.workflowCheckpoint,
+        currentObjective: state.currentObjective,
+        currentSessionId: state.currentSessionId,
+        systemStatus: state.systemStatus,
+        decomposition: state.decomposition,
+        selectedAgentId: state.selectedAgentId,
+        availableModels: state.availableModels,
+    };
+}
+
 function saveState(state) {
     try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(pickPersistable(state)));
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(pickBootstrapPersistable(state)));
     } catch (e) {
         console.warn('保存状态失败:', e);
     }
+
+    void saveIndexedValue(FULL_STATE_STORAGE_KEY, pickPersistable(state));
 }
 
-function loadState() {
+function loadBootstrapState() {
     try {
         const raw = localStorage.getItem(STORAGE_KEY);
         if (raw) return JSON.parse(raw);
@@ -269,6 +304,12 @@ function loadState() {
         console.warn('加载状态失败:', e);
     }
     return null;
+}
+
+async function loadFullState() {
+    const stored = await loadIndexedValue(FULL_STATE_STORAGE_KEY);
+    if (stored) return stored;
+    return loadBootstrapState();
 }
 
 function getInitialState() {
@@ -288,6 +329,7 @@ function getInitialState() {
         inbox: [],
         deliverables: [],
         pendingDecision: null,
+        workflowCheckpoint: null,
         currentObjective: '',
         currentSessionId: null,
         sessionHistory: [],
@@ -297,18 +339,61 @@ function getInitialState() {
         selectedAgentId: null,
         availableModels: {},
         promptLogs: [],
+        hasHydrated: false,
     };
 }
 
+function buildHydratedState(loaded) {
+    if (!loaded) return null;
+    const base = getInitialState();
+    return sanitizeLoadedState({
+        ...base,
+        ...loaded,
+        agents: loaded.agents || base.agents,
+        messages: loaded.messages || base.messages,
+        inbox: loaded.inbox || base.inbox,
+        deliverables: loaded.deliverables || base.deliverables,
+        sessionHistory: loaded.sessionHistory || base.sessionHistory,
+        systemLog: loaded.systemLog || base.systemLog,
+        promptLogs: loaded.promptLogs || base.promptLogs,
+        hasHydrated: false,
+    });
+}
+
+const persistedState = buildHydratedState(loadBootstrapState());
+
 export const useStore = create((set, get) => ({
-    ...(loadState() || getInitialState()),
+    ...(persistedState || getInitialState()),
+
+    hydrate: async () => {
+        const hydrateToken = mutationVersion;
+        const loaded = await loadFullState();
+        if (mutationVersion !== hydrateToken) {
+            set({ hasHydrated: true });
+            return;
+        }
+
+        const next = buildHydratedState(loaded);
+        if (!next) {
+            set({ hasHydrated: true });
+            return;
+        }
+
+        const hydrated = { ...next, hasHydrated: true };
+        saveState(hydrated);
+        set(hydrated);
+    },
 
     /**
      * 分发 action
      */
     dispatch: (action) => {
         set(state => {
-            const next = agentReducer(state, action);
+            const next = {
+                ...agentReducer(state, action),
+                hasHydrated: state.hasHydrated,
+            };
+            mutationVersion += 1;
             saveState(next);
             // 关键 action 写入日志
             if (['SET_OBJECTIVE', 'SET_STATUS', 'SET_PENDING_DECISION', 'RESOLVE_DECISION', 'ADD_DELIVERABLE', 'RESET'].includes(action.type)) {
@@ -326,16 +411,27 @@ export const useStore = create((set, get) => ({
     /**
      * 选中某个 Agent 查看详情
      */
-    selectAgent: (agentId) => set({ selectedAgentId: agentId }),
+    selectAgent: (agentId) => set(state => {
+        const next = { ...state, selectedAgentId: agentId };
+        mutationVersion += 1;
+        saveState(next);
+        return next;
+    }),
 
     /**
      * 重置系统
      */
     reset: () => set(() => {
-        const init = getInitialState();
+        const init = {
+            ...getInitialState(),
+            hasHydrated: get().hasHydrated,
+        };
+        mutationVersion += 1;
         saveState(init);
         return init;
     }),
 }));
+
+void useStore.getState().hydrate();
 
 export default useStore;

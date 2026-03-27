@@ -31,7 +31,8 @@ export default function App() {
     const [rightTab, setRightTab] = useState('progress');
     const [rightCollapsed, setRightCollapsed] = useState(false);
     const [leftCollapsed, setLeftCollapsed] = useState(false);
-    const [leftTab, setLeftTab] = useState('chats'); // 'chats' | 'agents'
+    const [leftTab, setLeftTab] = useState('chats');
+    const [showMoreTabs, setShowMoreTabs] = useState(false);
 
     const statusText = {
         idle: '待命中',
@@ -43,18 +44,26 @@ export default function App() {
         blocked: '⚠️ 阻塞',
     };
 
-    const rightTabs = [
+    // 核心 Tab（始终显示）
+    const coreTabs = [
         { key: 'progress', icon: '📊', label: '进度' },
+        { key: 'log', icon: '📜', label: '日志' },
+        { key: 'deliverables', icon: '📄', label: '报告' },
+        { key: 'config', icon: '⚙️', label: '配置' },
+    ];
+
+    // 高级 Tab（折叠在「更多」中）
+    const advancedTabs = [
         { key: 'cost', icon: '💰', label: '成本' },
         { key: 'timeline', icon: '⏱️', label: '回放' },
-        { key: 'log', icon: '📜', label: '日志' },
         { key: 'inbox', icon: '📨', label: '协作' },
-        { key: 'deliverables', icon: '📄', label: '报告' },
         { key: 'knowledge', icon: '📚', label: '知识库' },
         { key: 'plugins', icon: '🧩', label: '插件' },
         { key: 'debug', icon: '🔍', label: '调试' },
-        { key: 'config', icon: '⚙️', label: '配置' },
     ];
+
+    const allTabs = [...coreTabs, ...advancedTabs];
+    const isAdvancedTab = advancedTabs.some(t => t.key === rightTab);
 
     const layoutClasses = [
         'app-layout',
@@ -237,7 +246,7 @@ export default function App() {
 
                     {rightCollapsed ? (
                         <div className="sidebar-icons">
-                            {rightTabs.map(t => (
+                            {allTabs.map(t => (
                                 <button
                                     key={t.key}
                                     className={`sidebar-icon-btn ${rightTab === t.key ? 'sidebar-icon-btn--active' : ''}`}
@@ -251,16 +260,41 @@ export default function App() {
                     ) : (
                         <>
                             <div className="panel-tabs">
-                                {rightTabs.map(t => (
+                                {coreTabs.map(t => (
                                     <button
                                         key={t.key}
                                         className={`panel-tab ${rightTab === t.key ? 'panel-tab--active' : ''}`}
-                                        onClick={() => setRightTab(t.key)}
+                                        onClick={() => { setRightTab(t.key); setShowMoreTabs(false); }}
                                     >
                                         {t.icon} {t.label}
                                     </button>
                                 ))}
+                                <button
+                                    className={`panel-tab ${isAdvancedTab ? 'panel-tab--active' : ''}`}
+                                    onClick={() => setShowMoreTabs(!showMoreTabs)}
+                                    style={{ position: 'relative' }}
+                                >
+                                    ⚙ 更多 {showMoreTabs ? '▴' : '▾'}
+                                </button>
                             </div>
+                            {showMoreTabs && (
+                                <div style={{
+                                    display: 'flex', flexWrap: 'wrap', gap: '4px',
+                                    padding: '6px 8px', background: 'var(--bg-tertiary)',
+                                    borderBottom: '1px solid var(--border-primary)',
+                                }}>
+                                    {advancedTabs.map(t => (
+                                        <button
+                                            key={t.key}
+                                            className={`panel-tab ${rightTab === t.key ? 'panel-tab--active' : ''}`}
+                                            onClick={() => { setRightTab(t.key); setShowMoreTabs(false); }}
+                                            style={{ fontSize: '0.75rem', padding: '4px 8px' }}
+                                        >
+                                            {t.icon} {t.label}
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
                             <div className="panel__content">
                                 {rightTab === 'progress' && <ProgressDashboard />}
                                 {rightTab === 'cost' && <CostDashboard />}

@@ -82,7 +82,7 @@ export default function PluginPanel() {
                         <div className="empty-state">
                             <div className="empty-state__icon">📈</div>
                             <div className="empty-state__title">暂无性能数据</div>
-                            <div className="empty-state__text">执行任务后将自动记录 Agent 性能指标</div>
+                            <div className="empty-state__text">阶段完成并通过执行链后，将自动记录 Agent 性能指标</div>
                         </div>
                     ) : (
                         perfSummary.map((agent, idx) => (

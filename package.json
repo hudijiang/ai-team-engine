@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node --experimental-specifier-resolution=node --test tests/*.test.mjs",
+    "check": "npm run test && npm run build",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },

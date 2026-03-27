@@ -1,5 +1,5 @@
-import React, { useState, useMemo } from 'react';
-import { addDocument, removeDocument, getKnowledgeStats, clearKnowledge } from '../engine/ragEngine';
+import React, { useState, useMemo, useEffect } from 'react';
+import { addDocument, removeDocument, getKnowledgeStats, clearKnowledge, ensureKnowledgeBaseHydrated } from '../engine/ragEngine';
 
 /**
  * 知识库管理面板
@@ -10,6 +10,18 @@ export default function KnowledgePanel() {
     const [showUpload, setShowUpload] = useState(false);
     const [title, setTitle] = useState('');
     const [content, setContent] = useState('');
+
+    useEffect(() => {
+        let active = true;
+        void ensureKnowledgeBaseHydrated().then(() => {
+            if (active) {
+                setRefreshKey(k => k + 1);
+            }
+        });
+        return () => {
+            active = false;
+        };
+    }, []);
 
     const stats = useMemo(() => getKnowledgeStats(), [refreshKey]);
 

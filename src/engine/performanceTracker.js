@@ -2,26 +2,27 @@
  * Agent 性能评估追踪器
  * 追踪每个 Agent 的执行指标并计算评分
  */
+import { createPersistentResource } from '../utils/persistentResource.js';
 
 const STORAGE_KEY = 'agent-auto-performance';
+const performanceRecordResource = createPersistentResource({
+    storageKey: STORAGE_KEY,
+    initialValue: () => ([]),
+    bootstrapSelector: (records) => (records || []).slice(-60),
+});
 
 class PerformanceTracker {
     constructor() {
-        this.records = [];
-        this._load();
+        this.records = performanceRecordResource.get() || [];
+        void this._hydrate();
     }
 
-    _load() {
-        try {
-            const saved = localStorage.getItem(STORAGE_KEY);
-            if (saved) this.records = JSON.parse(saved);
-        } catch (_) { /* ignore */ }
+    async _hydrate() {
+        this.records = await performanceRecordResource.hydrate() || [];
     }
 
     _save() {
-        try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(this.records.slice(-300)));
-        } catch (_) { /* ignore */ }
+        performanceRecordResource.set(this.records.slice(-300));
     }
 
     /**

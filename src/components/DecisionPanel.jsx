@@ -4,6 +4,7 @@
  */
 import React, { useState } from 'react';
 import { useStore } from '../store/store';
+import { getDecisionConfirmState } from './decisionPanelLogic.js';
 
 export default function DecisionPanel({ onResolve }) {
     const pendingDecision = useStore(s => s.pendingDecision);
@@ -15,12 +16,11 @@ export default function DecisionPanel({ onResolve }) {
 
     const { topic, agentA, agentB, summary, proposals, dialogueHistory } = pendingDecision;
 
+    const decisionState = getDecisionConfirmState({ selectedIdx, showCustom, customInput });
+
     const handleResolve = () => {
-        if (showCustom && customInput.trim()) {
-            onResolve(-1, customInput.trim());
-        } else if (selectedIdx !== null) {
-            onResolve(selectedIdx);
-        }
+        if (!decisionState.payload) return;
+        onResolve(decisionState.payload.proposalIndex, decisionState.payload.customText);
     };
 
     return (
@@ -101,7 +101,7 @@ export default function DecisionPanel({ onResolve }) {
 
             <button
                 className="decision-panel__confirm"
-                disabled={selectedIdx === null && !(showCustom && customInput.trim())}
+                disabled={decisionState.disabled}
                 onClick={handleResolve}
             >
                 ✅ 确认决策

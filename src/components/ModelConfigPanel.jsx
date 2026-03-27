@@ -1,18 +1,30 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
     PROVIDERS,
-    loadProviderConfigs,
+    ensureProviderConfigsHydrated,
     saveProviderConfigs,
     fetchModelsFromAPI,
-    loadModelsCache,
+    ensureModelsCacheHydrated,
     saveModelsCache,
 } from '../engine/modelConfig';
 import { useStore } from '../store/store';
+import {
+    canFetchProviderModels,
+    flushPendingProviderConfigAutosave,
+    mergeProviderConfigUpdate,
+    queueProviderConfigAutosave,
+    shouldApplyHydratedProviderConfigs,
+} from './modelConfigPanelLogic.js';
+import {
+    hydrateModelConfigPanelState,
+    integrateFetchedProviderModels,
+    integrateProviderFetchError,
+} from './modelConfigPanelActions.js';
 
 /**
  * 模型配置面板
  * 按供应商配置 API URL / Key，并可拉取模型列表
- * 配置修改后自动保存到 localStorage，无需手动点击保存
+ * 配置修改后自动持久化，无需手动点击保存
  */
 export default function ModelConfigPanel() {
     const [configs, setConfigs] = useState({});
@@ -21,44 +33,58 @@ export default function ModelConfigPanel() {
     const [fetchResults, setFetchResults] = useState({});
     const dispatch = useStore(s => s.dispatch);
     const saveTimerRef = useRef(null);
+    const latestConfigsRef = useRef({});
+    const lastConfigMutationAtRef = useRef(0);
 
     // 初始化：加载 API 配置 + 恢复模型缓存
     useEffect(() => {
-        const savedConfigs = loadProviderConfigs();
-        setConfigs(savedConfigs);
+        let active = true;
+        const hydrateStartedAt = Date.now();
 
-        // 恢复模型缓存到 store 和本地 fetchResults
-        const cache = loadModelsCache();
-        if (cache.models && cache.models.length > 0) {
-            // 按 provider 分组
-            const grouped = {};
-            cache.models.forEach(m => {
-                if (!grouped[m.provider]) grouped[m.provider] = [];
-                grouped[m.provider].push(m);
+        const restorePersistedState = async () => {
+            const { configs: savedConfigs, fetchResults: restoredFetchResults } = await hydrateModelConfigPanelState({
+                dispatch,
+                ensureProviderConfigsHydratedImpl: ensureProviderConfigsHydrated,
+                ensureModelsCacheHydratedImpl: ensureModelsCacheHydrated,
             });
-            // 恢复到 fetchResults 显示
-            const results = {};
-            Object.entries(grouped).forEach(([pid, models]) => {
-                results[pid] = { models, error: null };
-                // 恢复到全局 store
-                dispatch({ type: 'SET_PROVIDER_MODELS', payload: { providerId: pid, models } });
+            if (!active) return;
+            if (!shouldApplyHydratedProviderConfigs({
+                hydrateStartedAt,
+                lastLocalMutationAt: lastConfigMutationAtRef.current,
+            })) {
+                return;
+            }
+
+            setConfigs(savedConfigs);
+            latestConfigsRef.current = savedConfigs;
+            if (Object.keys(restoredFetchResults).length > 0) {
+                setFetchResults(restoredFetchResults);
+            }
+        };
+
+        void restorePersistedState();
+
+        return () => {
+            active = false;
+            flushPendingProviderConfigAutosave({
+                saveTimerRef,
+                latestConfigsRef,
+                saveProviderConfigsImpl: saveProviderConfigs,
             });
-            setFetchResults(results);
-        }
+        };
     }, [dispatch]);
 
     // 修改配置后自动保存（防抖 500ms）
     const updateConfig = useCallback((providerId, field, value) => {
+        lastConfigMutationAtRef.current = Date.now();
         setConfigs(prev => {
-            const next = {
-                ...prev,
-                [providerId]: { ...prev[providerId], [field]: value },
-            };
-            // 防抖自动保存
-            if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-            saveTimerRef.current = setTimeout(() => {
-                saveProviderConfigs(next);
-            }, 500);
+            const next = mergeProviderConfigUpdate(prev, providerId, field, value);
+            queueProviderConfigAutosave({
+                saveTimerRef,
+                latestConfigsRef,
+                configs: next,
+                saveProviderConfigsImpl: saveProviderConfigs,
+            });
             return next;
         });
     }, []);
@@ -66,7 +92,7 @@ export default function ModelConfigPanel() {
     // 拉取某供应商的模型列表
     const handleFetchModels = useCallback(async (providerId) => {
         const config = configs[providerId];
-        if (!config?.apiUrl || !config?.apiKey) return;
+        if (!canFetchProviderModels(config)) return;
 
         // 先保存当前配置确保最新
         saveProviderConfigs(configs);
@@ -75,24 +101,19 @@ export default function ModelConfigPanel() {
         try {
             const models = await fetchModelsFromAPI(config.apiUrl, config.apiKey, providerId);
             setFetchResults(prev => {
-                const next = { ...prev, [providerId]: { models, error: null } };
-                // 将所有已获取的模型合并保存到缓存
-                const allModels = [];
-                Object.entries(next).forEach(([pid, r]) => {
-                    if (r.models) r.models.forEach(m => allModels.push({ ...m, provider: pid }));
+                return integrateFetchedProviderModels({
+                    providerId,
+                    models,
+                    previousFetchResults: prev,
+                    dispatch,
+                    saveModelsCacheImpl: saveModelsCache,
                 });
-                saveModelsCache({ models: allModels, timestamp: Date.now() });
-                return next;
-            });
-            // 写入全局 store
-            dispatch({
-                type: 'SET_PROVIDER_MODELS',
-                payload: { providerId, models },
             });
         } catch (err) {
-            setFetchResults(prev => ({
-                ...prev,
-                [providerId]: { models: [], error: err.message },
+            setFetchResults(prev => integrateProviderFetchError({
+                providerId,
+                error: err,
+                previousFetchResults: prev,
             }));
         } finally {
             setFetchingModels(null);
@@ -205,7 +226,7 @@ export default function ModelConfigPanel() {
             })}
 
             <div className="model-config-panel__note">
-                🔒 API Key 仅存储在浏览器本地 (localStorage)，不会上传到任何服务器。
+                🔒 API Key 仅持久化在浏览器本地（bootstrap cache + IndexedDB），不会上传到任何服务器。
             </div>
         </div>
     );

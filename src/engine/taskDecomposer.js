@@ -3,9 +3,10 @@
  * CEO 通过 AI 动态分析目标，智能组建团队和拆解任务
  * 完全由 LLM 驱动，不使用任何硬编码模板
  */
-import { sendChat, resolveProviderForModel } from './llmClient';
-import { loadProviderConfigs } from './modelConfig';
-import logger from '../utils/logger';
+import { sendChat, resolveProviderForModel } from './llmClient.js';
+import { ensureKnowledgeBaseHydrated, formatRAGContext } from './ragEngine.js';
+import { getMergedRoleLibrary, buildRoleLibraryText, buildPluginRolePrompt } from './capabilityRuntime.js';
+import logger from '../utils/logger.js';
 
 /**
  * 角色库 - 作为 LLM 的参考，LLM 可以从中选择也可以自创角色
@@ -60,15 +61,21 @@ const COLOR_POOL = ['#7C3AED', '#EC4899', '#3B82F6', '#10B981', '#F59E0B', '#EF4
  * @returns {Promise<Object>} 拆解结果 { type, roles, tasks, objective, ... }
  */
 export async function decomposeWithLLM(objective, model, availableModels) {
+    const roleLibrary = getMergedRoleLibrary(ROLE_LIBRARY, COLOR_POOL);
     // 构建角色库描述，让 LLM 知道有哪些可选角色
-    const roleDescriptions = Object.entries(ROLE_LIBRARY)
-        .map(([name, info]) => `  - ${name}（${info.category}）：${info.role}`)
-        .join('\n');
+    const roleDescriptions = buildRoleLibraryText(roleLibrary);
+    const pluginRolePrompt = buildPluginRolePrompt();
+    await ensureKnowledgeBaseHydrated();
+    const knowledgeContext = formatRAGContext(objective);
 
     const systemPrompt = `你是一个项目 CEO，擅长分析战略目标并组建最合适的执行团队。
 
 ## 可用角色库（可选择也可自创新角色）
 ${roleDescriptions}
+
+${pluginRolePrompt ? `${pluginRolePrompt}\n` : ''}
+
+${knowledgeContext ? `## 企业知识库参考\n${knowledgeContext}\n` : ''}
 
 ## 你的任务
 分析用户的战略目标，然后：
@@ -123,7 +130,7 @@ ${roleDescriptions}
     }
 
     // 验证并标准化
-    const result = validateAndNormalize(parsed, objective);
+    const result = validateAndNormalize(parsed, objective, roleLibrary);
     logger.info('TaskDecomposer', `LLM 分析完成：类型=${result.type}，角色=${result.roles.map(r => r.name).join(',')}，阶段=${result.totalPhases}`);
     return result;
 }
@@ -155,7 +162,7 @@ function extractJSON(text) {
 /**
  * 验证和标准化 LLM 返回的结构
  */
-function validateAndNormalize(parsed, objective) {
+function validateAndNormalize(parsed, objective, roleLibrary) {
     if (!parsed.type || !Array.isArray(parsed.roles) || !Array.isArray(parsed.tasks)) {
         throw new Error('JSON 缺少必要字段: type, roles, tasks');
     }
@@ -167,8 +174,9 @@ function validateAndNormalize(parsed, objective) {
     const roles = parsed.roles.map((r, i) => ({
         name: r.name,
         role: r.role || `负责${r.name}相关工作`,
-        color: ROLE_LIBRARY[r.name]?.color || COLOR_POOL[i % COLOR_POOL.length],
-        category: r.category || 'business',
+        color: roleLibrary[r.name]?.color || COLOR_POOL[i % COLOR_POOL.length],
+        category: r.category || roleLibrary[r.name]?.category || 'business',
+        model: r.model || roleLibrary[r.name]?.defaultModel || '',
     }));
 
     // 验证 tasks 结构
@@ -200,7 +208,7 @@ function validateAndNormalize(parsed, objective) {
  * 获取角色库（供 UI 展示或 LLM 参考）
  */
 export function getRoleLibrary() {
-    return ROLE_LIBRARY;
+    return getMergedRoleLibrary(ROLE_LIBRARY, COLOR_POOL);
 }
 
 export default { decomposeWithLLM, getRoleLibrary };
