@@ -250,17 +250,29 @@ test('provideHumanInput resumes execution from a persisted waiting_for_human che
     let runRemainingArgs = null;
     let finalizeArgs = null;
     let driveArgs = null;
+    let executeSubtaskArgs = null;
     const ceoMessages = [];
     const agentMessages = [];
 
     runner._emitCEOMessage = (...args) => ceoMessages.push(args);
     runner._emitAgentMessage = (...args) => agentMessages.push(args);
+    // 冷恢复：必须注入脱敏上下文，且仅 success 才能继续
+    runner._executeSubtask = async (...args) => {
+        executeSubtaskArgs = args;
+        return {
+            status: 'success',
+            summary: ['【工程师】已完成：登录系统'],
+            content: '登录成功',
+            source: 'llm',
+        };
+    };
     runner._runRemainingSubtasks = async (...args) => {
         runRemainingArgs = args;
         return true;
     };
     runner._finalizeAgentPhase = async (...args) => {
         finalizeArgs = args;
+        return true; // QA pass
     };
     runner._driveExecution = async (...args) => {
         driveArgs = args;
@@ -270,18 +282,30 @@ test('provideHumanInput resumes execution from a persisted waiting_for_human che
     await settleAsync(8);
 
     assert.equal(state.systemStatus, 'running');
-    assert.equal(state.workflowCheckpoint, null);
+    // 原子提升：恢复时不得先清空；mock 的 drive 未清理时保持 running_execution
+    assert.ok(
+        state.workflowCheckpoint === null
+        || state.workflowCheckpoint?.type === 'running_execution'
+    );
+    if (state.workflowCheckpoint?.type === 'running_execution') {
+        assert.equal(state.workflowCheckpoint.promotedFrom, 'waiting_for_human');
+    }
     assert.equal(runner.isRunning, false);
     assert.equal(getAgent(ceoAgent.id).state, AGENT_STATES.EXECUTING);
     assert.equal(getAgent(ceoAgent.id).currentTask, '协调协作，驱动执行');
     assert.equal(getAgent(worker.id).state, AGENT_STATES.EXECUTING);
     assert.equal(getAgent(worker.id).currentTask, '登录系统');
+    // 当前子任务须使用脱敏安全上下文，禁止验证码原文进入执行函数
+    assert.equal(executeSubtaskArgs[1], '登录系统');
+    assert.equal(String(executeSubtaskArgs[4] || '').includes('1234'), false);
+    assert.match(String(executeSubtaskArgs[4] || ''), /脱敏|人类完成|已接收|协助/i);
+    // 后续从 index+1 继续
     assert.equal(runRemainingArgs[5], 1);
     assert.equal(runRemainingArgs[6], checkpoint.phaseStartedAt);
     assert.equal(finalizeArgs[2].phase, '开发');
     assert.deepEqual([...driveArgs[3].completedPhases], ['准备', '开发']);
-    assert.match(ceoMessages[0][1][0], /已收到董事长的协助输入/);
-    assert.match(agentMessages[0][1][0], /子任务完成/);
+    assert.match(ceoMessages[0][1][0], /已接收董事长协助|协助/);
+    assert.match(agentMessages[0][1][0], /已完成：登录系统/);
 });
 
 test('provideHumanInput falls back to blocked state when persisted human checkpoint is incomplete', { concurrency: false }, async () => {
@@ -376,7 +400,14 @@ test('resolveDecision resumes execution from a persisted waiting_for_decision ch
 
     assert.equal(state.systemStatus, 'running');
     assert.equal(state.pendingDecision, null);
-    assert.equal(state.workflowCheckpoint, null);
+    // 原子提升：恢复中保持 running_execution（mock drive 未清理）
+    assert.ok(
+        state.workflowCheckpoint === null
+        || state.workflowCheckpoint?.type === 'running_execution'
+    );
+    if (state.workflowCheckpoint?.type === 'running_execution') {
+        assert.equal(state.workflowCheckpoint.promotedFrom, 'waiting_for_decision');
+    }
     assert.equal(runner.isRunning, false);
     assert.equal(getAgent(ceoAgent.id).state, AGENT_STATES.EXECUTING);
     assert.equal(getAgent(ceoAgent.id).currentTask, '根据董事长决策恢复执行');

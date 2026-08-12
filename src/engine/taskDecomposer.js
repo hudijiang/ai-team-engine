@@ -58,9 +58,10 @@ const COLOR_POOL = ['#7C3AED', '#EC4899', '#3B82F6', '#10B981', '#F59E0B', '#EF4
  * @param {string} objective - 战略目标
  * @param {string} model - CEO 使用的模型 ID
  * @param {Object} availableModels - 可用模型字典
+ * @param {AbortSignal} [signal] - 可选取消信号
  * @returns {Promise<Object>} 拆解结果 { type, roles, tasks, objective, ... }
  */
-export async function decomposeWithLLM(objective, model, availableModels) {
+export async function decomposeWithLLM(objective, model, availableModels, signal = null) {
     const roleLibrary = getMergedRoleLibrary(ROLE_LIBRARY, COLOR_POOL);
     // 构建角色库描述，让 LLM 知道有哪些可选角色
     const roleDescriptions = buildRoleLibraryText(roleLibrary);
@@ -121,6 +122,7 @@ ${knowledgeContext ? `## 企业知识库参考\n${knowledgeContext}\n` : ''}
         ],
         availableModels,
         stream: false,
+        signal,
     });
 
     // 提取 JSON
@@ -170,32 +172,103 @@ function validateAndNormalize(parsed, objective, roleLibrary) {
         throw new Error('roles 或 tasks 为空');
     }
 
-    // 为角色分配颜色（角色库有的用库颜色，否则用颜色池）
-    const roles = parsed.roles.map((r, i) => ({
-        name: r.name,
-        role: r.role || `负责${r.name}相关工作`,
-        color: roleLibrary[r.name]?.color || COLOR_POOL[i % COLOR_POOL.length],
-        category: r.category || roleLibrary[r.name]?.category || 'business',
-        model: r.model || roleLibrary[r.name]?.defaultModel || '',
-    }));
+    // 角色数量与命名约束
+    if (parsed.roles.length > 8) {
+        throw new Error('roles 过多（最多 8 个）');
+    }
+    if (parsed.tasks.length > 16) {
+        throw new Error('tasks 过多（最多 16 个）');
+    }
 
-    // 验证 tasks 结构
+    const roleNameSeen = new Set();
+    const roles = [];
+    for (let i = 0; i < parsed.roles.length; i++) {
+        const r = parsed.roles[i];
+        const name = String(r?.name || '').trim().slice(0, 40);
+        if (!name) throw new Error(`roles[${i}] 缺少 name`);
+        if (roleNameSeen.has(name)) throw new Error(`角色名重复：${name}`);
+        roleNameSeen.add(name);
+        roles.push({
+            name,
+            role: String(r.role || `负责${name}相关工作`).slice(0, 200),
+            color: roleLibrary[name]?.color || COLOR_POOL[i % COLOR_POOL.length],
+            category: r.category || roleLibrary[name]?.category || 'business',
+            model: r.model || roleLibrary[name]?.defaultModel || '',
+        });
+    }
+
     const roleNames = new Set(roles.map(r => r.name));
-    const tasks = parsed.tasks.map(t => ({
-        phase: t.phase,
-        assignee: roleNames.has(t.assignee) ? t.assignee : roles[0].name,
-        subtasks: Array.isArray(t.subtasks) && t.subtasks.length > 0
-            ? t.subtasks
-            : [`分析${t.phase}的需求`, `执行${t.phase}的核心工作`, `完成${t.phase}并输出成果`],
-        dependencies: Array.isArray(t.dependencies) ? t.dependencies : [],
-        duration: t.duration || 3,
-    }));
+    const phaseSeen = new Set();
+    const tasks = [];
+
+    for (let i = 0; i < parsed.tasks.length; i++) {
+        const t = parsed.tasks[i];
+        const phase = String(t?.phase || '').trim().slice(0, 60);
+        if (!phase) throw new Error(`tasks[${i}] 缺少 phase`);
+        if (phaseSeen.has(phase)) throw new Error(`阶段名重复：${phase}`);
+        phaseSeen.add(phase);
+
+        if (!roleNames.has(t.assignee)) {
+            throw new Error(`阶段「${phase}」负责人「${t.assignee}」不在 roles 中`);
+        }
+
+        let subtasks = Array.isArray(t.subtasks) ? t.subtasks.map(s => String(s).trim().slice(0, 120)).filter(Boolean) : [];
+        if (subtasks.length === 0) {
+            throw new Error(`阶段「${phase}」缺少可执行 subtasks`);
+        }
+        if (subtasks.length > 8) subtasks = subtasks.slice(0, 8);
+
+        const dependencies = Array.isArray(t.dependencies)
+            ? t.dependencies.map(d => String(d).trim()).filter(Boolean)
+            : [];
+
+        const duration = Math.min(10, Math.max(1, Number(t.duration) || 3));
+        tasks.push({ phase, assignee: t.assignee, subtasks, dependencies, duration });
+    }
+
+    // 依赖必须指向存在的阶段；至少有一个无依赖起点
+    for (const t of tasks) {
+        for (const dep of t.dependencies) {
+            if (!phaseSeen.has(dep)) {
+                throw new Error(`阶段「${t.phase}」依赖不存在的阶段「${dep}」`);
+            }
+            if (dep === t.phase) {
+                throw new Error(`阶段「${t.phase}」不能依赖自身`);
+            }
+        }
+    }
+    if (!tasks.some(t => t.dependencies.length === 0)) {
+        throw new Error('至少需要一个无依赖的起始阶段');
+    }
+
+    // 简单环检测
+    const graph = {};
+    phaseSeen.forEach(p => { graph[p] = []; });
+    tasks.forEach(t => {
+        t.dependencies.forEach(dep => graph[dep].push(t.phase));
+    });
+    const visited = new Set();
+    const stack = new Set();
+    const dfs = (node) => {
+        if (stack.has(node)) return true;
+        if (visited.has(node)) return false;
+        visited.add(node);
+        stack.add(node);
+        for (const next of graph[node] || []) {
+            if (dfs(next)) return true;
+        }
+        stack.delete(node);
+        return false;
+    };
+    for (const p of phaseSeen) {
+        if (dfs(p)) throw new Error('任务依赖存在环');
+    }
 
     return {
-        type: parsed.type,
+        type: String(parsed.type).slice(0, 80),
         roles,
         tasks,
-        objective,
+        objective: String(objective).slice(0, 500),
         totalPhases: tasks.length,
         estimatedDuration: tasks.reduce((sum, t) => sum + t.duration, 0),
         analysis: {

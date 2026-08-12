@@ -192,6 +192,11 @@ export async function settleAsync(iterations = 4) {
 export async function importFreshFromRoot(relativePath) {
     importCounter += 1;
     const moduleUrl = pathToFileURL(path.resolve(projectRoot, relativePath));
-    moduleUrl.searchParams.set('test', String(importCounter));
+    // CEOAgentRunner has no module-level mutable execution state. Keeping one
+    // canonical source URL lets V8 merge coverage from all test files instead
+    // of treating every query-string import as a different script.
+    if (relativePath !== 'src/engine/ceoAgent.js') {
+        moduleUrl.searchParams.set('test', String(importCounter));
+    }
     return import(moduleUrl.href);
 }

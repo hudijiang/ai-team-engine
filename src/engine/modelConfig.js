@@ -13,6 +13,11 @@ const MODELS_CACHE_KEY = 'agent-auto-models-cache';
 /**
  * 供应商默认配置
  */
+/**
+ * 供应商清单
+ * chatAdapter: 实际对话适配器 id（见 llmClient）
+ * verified: 是否经过本仓库契约验证
+ */
 export const PROVIDERS = [
     {
         id: 'openai',
@@ -21,6 +26,9 @@ export const PROVIDERS = [
         defaultApiUrl: 'https://api.openai.com/v1',
         modelsPath: '/models',
         placeholder: 'sk-...',
+        chatAdapter: 'openai',
+        verified: true,
+        note: '官方 OpenAI Chat Completions',
     },
     {
         id: 'anthropic',
@@ -29,14 +37,9 @@ export const PROVIDERS = [
         defaultApiUrl: 'https://api.anthropic.com/v1',
         modelsPath: '/models',
         placeholder: 'sk-ant-...',
-    },
-    {
-        id: 'google',
-        name: 'Google',
-        icon: '🔵',
-        defaultApiUrl: 'https://generativelanguage.googleapis.com/v1beta',
-        modelsPath: '/models',
-        placeholder: 'AIza...',
+        chatAdapter: 'anthropic',
+        verified: true,
+        note: 'Messages API 适配',
     },
     {
         id: 'deepseek',
@@ -45,30 +48,31 @@ export const PROVIDERS = [
         defaultApiUrl: 'https://api.deepseek.com/v1',
         modelsPath: '/models',
         placeholder: 'sk-...',
+        chatAdapter: 'openai',
+        verified: true,
+        note: 'OpenAI 兼容模式',
     },
     {
         id: 'alibaba',
-        name: 'Alibaba (Qwen)',
+        name: 'Alibaba (Qwen 兼容模式)',
         icon: '🔴',
         defaultApiUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
         modelsPath: '/models',
         placeholder: 'sk-...',
-    },
-    {
-        id: 'minimax',
-        name: 'MiniMax',
-        icon: '🟡',
-        defaultApiUrl: 'https://api.minimax.chat/v1',
-        modelsPath: '/models',
-        placeholder: 'eyJ...',
+        chatAdapter: 'openai',
+        verified: true,
+        note: '仅兼容模式 endpoint',
     },
     {
         id: 'zhipu',
-        name: '智谱AI (GLM)',
+        name: '智谱AI (GLM 兼容)',
         icon: '🔶',
         defaultApiUrl: 'https://open.bigmodel.cn/api/paas/v4',
         modelsPath: '/models',
         placeholder: '...',
+        chatAdapter: 'openai',
+        verified: true,
+        note: 'OpenAI 兼容风格',
     },
     {
         id: 'custom',
@@ -77,6 +81,32 @@ export const PROVIDERS = [
         defaultApiUrl: '',
         modelsPath: '/models',
         placeholder: 'sk-...',
+        chatAdapter: 'openai',
+        verified: true,
+        note: '任意 OpenAI 兼容网关',
+    },
+    // 以下未经验证原生协议，保留为实验项（UI 会标注）
+    {
+        id: 'google',
+        name: 'Google (实验·需兼容代理)',
+        icon: '🔵',
+        defaultApiUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        modelsPath: '/models',
+        placeholder: 'AIza...',
+        chatAdapter: 'openai',
+        verified: false,
+        note: '原生 Gemini 协议未实现；仅当你的网关提供 OpenAI 兼容层时可用',
+    },
+    {
+        id: 'minimax',
+        name: 'MiniMax (实验·需兼容代理)',
+        icon: '🟡',
+        defaultApiUrl: 'https://api.minimax.chat/v1',
+        modelsPath: '/models',
+        placeholder: 'eyJ...',
+        chatAdapter: 'openai',
+        verified: false,
+        note: '未做原生协议验证，依赖 OpenAI 兼容',
     },
 ];
 

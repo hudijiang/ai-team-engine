@@ -77,11 +77,17 @@ export class MCPClient {
      * 连接并发现工具
      */
     async connect() {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 8000);
         try {
             const headers = { 'Content-Type': 'application/json' };
             if (this.authToken) headers['Authorization'] = `Bearer ${this.authToken}`;
 
-            const res = await fetch(`${this.serverUrl}/tools/list`, { headers });
+            // 注意：此实现为简化 HTTP 示意，非完整 MCP 标准协议
+            const res = await fetch(`${this.serverUrl}/tools/list`, {
+                headers,
+                signal: controller.signal,
+            });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
             this.tools = data.tools || [];
@@ -89,28 +95,40 @@ export class MCPClient {
             return { success: true, tools: this.tools };
         } catch (e) {
             this.connected = false;
-            return { success: false, error: e.message };
+            return { success: false, error: e.name === 'AbortError' ? '连接超时' : e.message };
+        } finally {
+            clearTimeout(timer);
         }
     }
 
     /**
-     * 调用 MCP 工具
+     * 调用 MCP 工具（高风险；默认策略拒绝，需显式 allowHighRisk）
      */
     async callTool(toolName, params = {}) {
         if (!this.connected) throw new Error('MCP Server 未连接');
 
-        const headers = { 'Content-Type': 'application/json' };
-        if (this.authToken) headers['Authorization'] = `Bearer ${this.authToken}`;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15000);
+        try {
+            const headers = { 'Content-Type': 'application/json' };
+            if (this.authToken) headers['Authorization'] = `Bearer ${this.authToken}`;
 
-        const res = await fetch(`${this.serverUrl}/tools/call`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ name: toolName, arguments: params }),
-        });
+            const res = await fetch(`${this.serverUrl}/tools/call`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ name: toolName, arguments: params }),
+                signal: controller.signal,
+            });
 
-        if (!res.ok) throw new Error(`工具调用失败: HTTP ${res.status}`);
-        const data = await res.json();
-        return data.content?.[0]?.text || JSON.stringify(data);
+            if (!res.ok) throw new Error(`工具调用失败: HTTP ${res.status}`);
+            const data = await res.json();
+            return data.content?.[0]?.text || JSON.stringify(data);
+        } catch (e) {
+            if (e.name === 'AbortError') throw new Error('MCP 工具调用超时');
+            throw e;
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     /**

@@ -3,14 +3,24 @@
  * 管理 Agents、消息、系统状态
  */
 import { create } from 'zustand';
+import { v4 as uuidv4 } from 'uuid';
 import { createAgent, AGENT_STATES } from '../engine/agentEngine.js';
 import logger from '../utils/logger.js';
 import { loadIndexedValue, saveIndexedValue } from '../utils/indexedDBStorage.js';
+import { redactSensitiveDeep } from '../utils/sensitiveData.js';
 import { sanitizeLoadedState } from './storeRecovery.js';
 
 const STORAGE_KEY = 'agent-auto-state';
 const FULL_STATE_STORAGE_KEY = 'state:full';
 let mutationVersion = 0;
+
+/**
+ * 对话消息会进入本地持久化、历史会话和导出视图，因此必须在 reducer
+ * 这一条公共写入边界统一脱敏；调用方 helper 里的脱敏只作为纵深防御。
+ */
+export function sanitizeMessagePayload(payload) {
+    return redactSensitiveDeep(payload);
+}
 
 /**
  * 状态 Reducer
@@ -49,27 +59,27 @@ function agentReducer(state, action) {
         case 'ADD_MESSAGE':
             return {
                 ...state,
-                messages: [...state.messages, action.payload],
+                messages: [...state.messages, sanitizeMessagePayload(action.payload)],
             };
 
         case 'UPSERT_MESSAGE': {
-            const { clientId } = action.payload || {};
+            const safePayload = sanitizeMessagePayload(action.payload);
+            const { clientId } = safePayload || {};
             if (!clientId) {
-                return { ...state, messages: [...state.messages, action.payload] };
+                return { ...state, messages: [...state.messages, safePayload] };
             }
             const idx = state.messages.findIndex(m => m.clientId === clientId);
             if (idx === -1) {
-                return { ...state, messages: [...state.messages, action.payload] };
+                return { ...state, messages: [...state.messages, safePayload] };
             }
             const next = [...state.messages];
-            next[idx] = { ...next[idx], ...action.payload };
+            next[idx] = { ...next[idx], ...safePayload };
             return { ...state, messages: next };
         }
 
         case 'SET_OBJECTIVE': {
-            const dateStr = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15); // 20260303T093601
-            const prefix = action.payload.replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, '').slice(0, 20);
-            const sessionId = `${prefix}_${dateStr}`;
+            // 会话 ID 只承担关联作用，不得包含目标正文或其派生片段。
+            const sessionId = `session-${uuidv4()}`;
             return {
                 ...state,
                 currentObjective: action.payload,
@@ -118,11 +128,43 @@ function agentReducer(state, action) {
         }
 
         case 'RESOLVE_DECISION': {
+            const expectedGateId = action.payload?.gateId;
+            if (expectedGateId && state.pendingDecision?.gateId !== expectedGateId) {
+                return state;
+            }
             return { ...state, pendingDecision: null };
         }
 
+        case 'ROLLBACK_GATE': {
+            const { gateId, gateType, status = 'blocked' } = action.payload || {};
+            if (!gateId) return state;
+
+            const checkpointOwned = state.workflowCheckpoint?.gateId === gateId
+                && (!gateType || state.workflowCheckpoint?.type === gateType);
+            const decisionOwned = state.pendingDecision?.gateId === gateId;
+            if (!checkpointOwned && !decisionOwned) return state;
+
+            return {
+                ...state,
+                ...(checkpointOwned ? { workflowCheckpoint: null } : {}),
+                ...(decisionOwned ? { pendingDecision: null } : {}),
+                ...((checkpointOwned || decisionOwned)
+                    && (!gateType || state.systemStatus === gateType)
+                    ? { systemStatus: status }
+                    : {}),
+            };
+        }
+
         case 'SET_WORKFLOW_CHECKPOINT': {
-            return { ...state, workflowCheckpoint: action.payload };
+            const promotedToRunning = action.payload?.type === 'running_execution'
+                && !!action.payload?.promotedFrom;
+            return {
+                ...state,
+                workflowCheckpoint: action.payload,
+                // 门禁提升时把状态和检查点放进同一次 Zustand 变更，
+                // 避免持久化层观察到 running 与旧门禁检查点的不一致组合。
+                ...(promotedToRunning ? { systemStatus: 'running' } : {}),
+            };
         }
 
         case 'CLEAR_WORKFLOW_CHECKPOINT': {
@@ -346,14 +388,21 @@ function getInitialState() {
 function buildHydratedState(loaded) {
     if (!loaded) return null;
     const base = getInitialState();
+    const loadedMessages = Array.isArray(loaded.messages) ? loaded.messages : base.messages;
+    const loadedHistory = Array.isArray(loaded.sessionHistory) ? loaded.sessionHistory : base.sessionHistory;
+    const safeMessages = loadedMessages.map(sanitizeMessagePayload);
+    const safeSessionHistory = loadedHistory.map(session => ({
+        ...session,
+        messages: (Array.isArray(session?.messages) ? session.messages : []).map(sanitizeMessagePayload),
+    }));
     return sanitizeLoadedState({
         ...base,
         ...loaded,
         agents: loaded.agents || base.agents,
-        messages: loaded.messages || base.messages,
+        messages: safeMessages,
         inbox: loaded.inbox || base.inbox,
         deliverables: loaded.deliverables || base.deliverables,
-        sessionHistory: loaded.sessionHistory || base.sessionHistory,
+        sessionHistory: safeSessionHistory,
         systemLog: loaded.systemLog || base.systemLog,
         promptLogs: loaded.promptLogs || base.promptLogs,
         hasHydrated: false,
@@ -419,16 +468,17 @@ export const useStore = create((set, get) => ({
     }),
 
     /**
-     * 重置系统
+     * 重置系统 — 与 RESET action 一致：归档当前会话，避免历史丢失
      */
-    reset: () => set(() => {
-        const init = {
-            ...getInitialState(),
-            hasHydrated: get().hasHydrated,
+    reset: () => set(state => {
+        const next = {
+            ...agentReducer(state, { type: 'RESET' }),
+            hasHydrated: state.hasHydrated,
         };
         mutationVersion += 1;
-        saveState(init);
-        return init;
+        saveState(next);
+        logger.info('Store', 'RESET (via reset())');
+        return next;
     }),
 }));
 

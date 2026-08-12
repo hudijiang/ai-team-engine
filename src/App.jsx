@@ -14,6 +14,7 @@ import PluginPanel from './components/PluginPanel';
 import useInboxSubscriber from './hooks/useInboxSubscriber';
 import CommandInput from './components/CommandInput';
 import { useStore } from './store/store';
+import { clearRunner } from './engine/runnerRuntime';
 
 /**
  * 主应用组件
@@ -71,9 +72,10 @@ export default function App() {
         leftCollapsed ? 'app-layout--left-collapsed' : '',
     ].filter(Boolean).join(' ');
 
-    // 新建对话
+    // 新建对话 — 必须同时停止内存中的 runner，避免幽灵执行链
     const handleNewChat = () => {
         if (systemStatus === 'running') return;
+        clearRunner();
         dispatch({ type: 'RESET' });
     };
 

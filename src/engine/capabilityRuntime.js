@@ -6,10 +6,27 @@ import { ensureKnowledgeBaseHydrated, formatRAGContext } from './ragEngine.js';
 import { getAllTools } from './toolRegistry.js';
 import { getEnabledPlugins, getPluginRoles } from './pluginSystem.js';
 import { ensureMCPConfigsHydrated, getMCPClient } from './mcpClient.js';
+import {
+    executeWithTimeout,
+    isToolAllowed,
+    recordToolAudit,
+    resolveToolRisk,
+    validateToolParams,
+} from './toolPolicy.js';
+import { redactSensitive } from '../utils/sensitiveData.js';
 
 const MCP_DISCOVERY_TIMEOUT_MS = 3000;
+const TOOL_EXEC_TIMEOUT_MS = 15000;
 const MAX_TOOL_RESULT_CHARS = 1600;
 const TOOL_TRIGGER_PATTERN = /搜索|检索|查找|查询|调研|资料|信息|对比|统计|时间|日期|计算|公式|research|search|lookup|time|date|calculate|compare/i;
+
+/** 默认工具策略：仅只读；MCP 高风险默认拒绝；禁用模拟工具 */
+export const DEFAULT_TOOL_POLICY = {
+    allowReversibleWrite: false,
+    allowHighRisk: false,
+    allowSimulated: false,
+    denylist: [],
+};
 
 function withTimeout(promise, timeoutMs, fallback) {
     return Promise.race([
@@ -111,6 +128,9 @@ async function registerMCPTools(toolMap) {
                 name: toolName,
                 description: `${tool.description || tool.name}（MCP: ${config.name || client.name || config.url}）`,
                 parameters: tool.inputSchema?.properties || {},
+                required: tool.inputSchema?.required || [],
+                risk: 'high_risk',
+                provenance: 'mcp',
                 source: 'mcp',
                 execute: async (params = {}) => client.callTool(tool.name, params),
             });
@@ -149,11 +169,23 @@ export async function loadExecutionCapabilities(query = '') {
     const toolMap = new Map();
 
     Object.values(getAllTools()).forEach(tool => {
+        // 模拟工具默认不进入 map，避免被误调用
+        if (tool.simulated && !DEFAULT_TOOL_POLICY.allowSimulated) return;
+        const withProv = {
+            ...tool,
+            provenance: tool.provenance || tool.source || 'builtin',
+            source: tool.source || tool.provenance || 'builtin',
+        };
+        const risk = resolveToolRisk(tool.name, withProv);
         toolMap.set(tool.name, {
             name: tool.name,
             description: tool.description,
             parameters: tool.parameters || {},
-            source: 'builtin',
+            required: tool.required || [],
+            risk,
+            simulated: !!tool.simulated,
+            provenance: withProv.provenance,
+            source: withProv.source,
             execute: tool.execute,
         });
     });
@@ -161,43 +193,135 @@ export async function loadExecutionCapabilities(query = '') {
     getEnabledPlugins().forEach(plugin => {
         (plugin.tools || []).forEach(tool => {
             if (!tool?.name || typeof tool.execute !== 'function' || toolMap.has(tool.name)) return;
+            const withProv = {
+                ...tool,
+                provenance: 'plugin',
+                source: 'plugin',
+            };
+            const risk = resolveToolRisk(tool.name, withProv);
             toolMap.set(tool.name, {
                 name: tool.name,
                 description: `${tool.description || tool.name}（插件：${plugin.name}）`,
                 parameters: tool.parameters || {},
+                required: tool.required || [],
+                risk,
+                provenance: 'plugin',
                 source: 'plugin',
                 execute: tool.execute,
             });
         });
     });
 
+    // 仍注册 MCP 以便发现，但默认策略拒绝执行
     const mcpCount = await registerMCPTools(toolMap);
+
+    // Prompt 中只暴露策略允许的工具，避免模型发起必然失败的高风险调用
+    const visibleTools = Array.from(toolMap.values()).filter(tool =>
+        isToolAllowed(tool.name, tool, DEFAULT_TOOL_POLICY).allowed
+    );
 
     return {
         ragContext,
         toolMap,
-        toolPrompt: buildToolPrompt(Array.from(toolMap.values())),
+        toolPrompt: buildToolPrompt(visibleTools),
         toolCount: toolMap.size,
+        allowedToolCount: visibleTools.length,
         mcpCount,
+        policy: { ...DEFAULT_TOOL_POLICY },
     };
 }
 
 export function shouldUseToolLoop(query, capabilities) {
-    if (!capabilities?.toolCount) return false;
-    if (capabilities.mcpCount > 0) return true;
+    if (!capabilities?.allowedToolCount && !capabilities?.toolCount) return false;
+    // 商用：仅当有**允许执行**的工具且 query 触发时开启；MCP 存在不再自动开启
+    if (!(capabilities.allowedToolCount > 0)) return false;
     return TOOL_TRIGGER_PATTERN.test(query || '');
 }
 
-export async function executeCapabilityTool(toolMap, toolName, params = {}) {
+/**
+ * 类型化工具执行结果
+ * @returns {Promise<{ok: boolean, status: string, data: string, error: string, risk?: string}>}
+ */
+export async function executeCapabilityTool(toolMap, toolName, params = {}, policy = DEFAULT_TOOL_POLICY) {
+    const fail = (status, error, risk = '') => ({
+        ok: false,
+        status,
+        data: '',
+        error: String(error || status),
+        risk,
+    });
+
     const tool = toolMap.get(toolName);
-    if (!tool) return `工具 "${toolName}" 不存在`;
+    if (!tool) {
+        recordToolAudit({ tool: toolName, status: 'missing', params: redactSensitive(JSON.stringify(params || {})) });
+        return fail('missing', `工具 "${toolName}" 不存在`);
+    }
+
+    if (tool.simulated && !policy.allowSimulated) {
+        recordToolAudit({
+            tool: toolName,
+            status: 'denied',
+            reason: '模拟工具默认禁用',
+            params: redactSensitive(JSON.stringify(params || {})),
+        });
+        return fail('denied', '模拟工具默认禁用，不得计入成功交付');
+    }
+
+    const gate = isToolAllowed(toolName, tool, policy);
+    if (!gate.allowed) {
+        recordToolAudit({
+            tool: toolName,
+            status: 'denied',
+            risk: gate.risk,
+            reason: gate.reason,
+            params: redactSensitive(JSON.stringify(params || {})),
+        });
+        return fail('denied', `工具调用被拒绝：${gate.reason}`, gate.risk);
+    }
+
+    const validation = validateToolParams(tool, params || {});
+    if (!validation.ok) {
+        recordToolAudit({
+            tool: toolName,
+            status: 'invalid_params',
+            reason: validation.errors.join('; '),
+            params: redactSensitive(JSON.stringify(params || {})),
+        });
+        return fail('invalid_params', `工具参数无效：${validation.errors.join('；')}`, gate.risk);
+    }
 
     try {
-        const result = await tool.execute(params);
-        return truncateToolResult(result);
+        const result = await executeWithTimeout(
+            () => tool.execute(params),
+            TOOL_EXEC_TIMEOUT_MS
+        );
+        const text = redactSensitive(truncateToolResult(result));
+        recordToolAudit({
+            tool: toolName,
+            status: 'ok',
+            risk: gate.risk,
+            params: redactSensitive(JSON.stringify(params || {})),
+            resultPreview: String(text).slice(0, 200),
+        });
+        return { ok: true, status: 'ok', data: text, error: '', risk: gate.risk };
     } catch (e) {
-        return `工具执行失败：${e.message}`;
+        const safeError = redactSensitive(e?.message || 'unknown error');
+        recordToolAudit({
+            tool: toolName,
+            status: 'error',
+            risk: gate.risk,
+            reason: safeError,
+            error: safeError,
+            params: redactSensitive(JSON.stringify(params || {})),
+        });
+        return fail('error', `工具执行失败：${safeError}`, gate.risk);
     }
+}
+
+/** 兼容旧调用方：仅取文本（失败时返回错误串） */
+export async function executeCapabilityToolText(toolMap, toolName, params = {}, policy = DEFAULT_TOOL_POLICY) {
+    const r = await executeCapabilityTool(toolMap, toolName, params, policy);
+    return r.ok ? r.data : r.error;
 }
 
 export function summarizeToolCall(toolName, params = {}) {

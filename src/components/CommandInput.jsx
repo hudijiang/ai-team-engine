@@ -4,6 +4,7 @@ import { clearRunner, getRunner, peekRunner, replaceRunner } from '../engine/run
 import DecisionPanel from './DecisionPanel';
 import {
     resolveDecisionAction,
+    resumeExecutionAction,
     skipHumanInputAction,
     startExecutionFromCheckpoint,
     submitHumanInputAction,
@@ -29,6 +30,22 @@ export default function CommandInput() {
     const isBlocked = systemStatus === 'blocked';
     const isWaitingDecision = systemStatus === 'waiting_for_decision';
     const isPaused = systemStatus === 'paused';
+    const canResumeFromCheckpoint = isPaused && workflowCheckpoint?.type === 'running_execution';
+    const completedPhaseCount = canResumeFromCheckpoint
+        ? (workflowCheckpoint.completedPhases || []).length
+        : 0;
+    const inFlightCount = canResumeFromCheckpoint
+        ? (workflowCheckpoint.inFlight || []).length
+        : 0;
+    const inFlightHint = canResumeFromCheckpoint && inFlightCount > 0
+        ? (workflowCheckpoint.inFlight || [])
+            .map(f => {
+                const total = f.totalSubtasks || '?';
+                const done = f.nextSubtaskIndex ?? 0;
+                return `${f.phase} ${done}/${total}`;
+            })
+            .join('；')
+        : '';
 
     const [humanInput, setHumanInput] = useState('');
 
@@ -105,10 +122,16 @@ export default function CommandInput() {
         peekRunner()?.pause();
     }, []);
 
-    /** 恢复执行 */
+    /** 恢复执行（内存 pause 或检查点续跑） */
     const handleUnpause = useCallback(() => {
-        peekRunner()?.unpause();
-    }, []);
+        resumeExecutionAction({
+            workflowCheckpoint,
+            dispatch,
+            getSnapshot,
+            getRunnerImpl: getRunner,
+            peekRunnerImpl: peekRunner,
+        });
+    }, [dispatch, getSnapshot, workflowCheckpoint]);
 
     const handleKeyDown = (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
@@ -210,18 +233,28 @@ export default function CommandInput() {
                 </div>
             )}
 
-            {/* 暂停状态提示 */}
+            {/* 暂停状态提示（含刷新后检查点恢复） */}
             {isPaused && (
                 <div className="command-input__config-notice" style={{ borderColor: 'rgba(139,92,246,0.4)' }}>
                     <div className="command-input__config-text" style={{ color: 'var(--accent-purple)' }}>
-                        ⏸️ 执行已暂停。您可以调整团队配置，然后恢复执行。
+                        {canResumeFromCheckpoint
+                            ? (
+                                <>
+                                    ⏸️ 执行已中断（阶段/子任务检查点可用）。
+                                    已完成 {completedPhaseCount} 个阶段
+                                    {inFlightCount > 0 ? `，进行中 ${inFlightCount} 个阶段（${inFlightHint}）` : ''}
+                                    。可从断点继续，或重置后重新发布。
+                                </>
+                            )
+                            : '⏸️ 执行已暂停。您可以调整团队配置，然后恢复执行。'}
                     </div>
                     <div className="command-input__config-actions">
                         <button
                             className="command-input__start-btn"
                             onClick={handleUnpause}
+                            id="resume-execution-btn"
                         >
-                            ▶️ 恢复执行
+                            {canResumeFromCheckpoint ? '▶️ 从检查点继续' : '▶️ 恢复执行'}
                         </button>
                         <button
                             className="command-input__reset"

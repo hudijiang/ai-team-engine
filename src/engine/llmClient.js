@@ -2,16 +2,29 @@
  * LLM 客户端
  * 基于用户在 ModelConfigPanel 中保存的 provider 配置，调用 OpenAI/Anthropic 兼容接口
  * 仅在浏览器侧发起 fetch；不在服务端存储任何密钥。
+ *
+ * 支持：
+ * - 外部 AbortSignal（runner stop / 重置）
+ * - 请求级超时
+ * - SSE 流式读取可中断
  */
 import { ensureProviderConfigsHydrated, PROVIDERS } from './modelConfig.js';
 import tokenTracker from './tokenTracker.js';
 import logger from '../utils/logger.js';
+import { redactSensitive, redactSensitiveDeep } from '../utils/sensitiveData.js';
 
 const REQUEST_TIMEOUT_MS = 90000;
 
+export const LLM_ERROR = {
+    TIMEOUT: 'LLM_TIMEOUT',
+    CANCELLED: 'LLM_CANCELLED',
+    CONFIG: 'LLM_CONFIG',
+    HTTP: 'LLM_HTTP',
+};
+
 // 简单节流：按 provider 限制 ~3 rps
 const providerBuckets = new Map(); // providerId -> timestamps[]
-async function throttle(providerId) {
+async function throttle(providerId, signal) {
     const bucket = providerBuckets.get(providerId) || [];
     const now = Date.now();
     bucket.push(now);
@@ -20,9 +33,31 @@ async function throttle(providerId) {
     if (bucket.length === 3) {
         const delta = now - bucket[0];
         if (delta < 1000) {
-            await new Promise(res => setTimeout(res, 1000 - delta));
+            await sleep(1000 - delta, signal);
         }
     }
+}
+
+function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(createAbortError(signal, true));
+            return;
+        }
+        const timer = setTimeout(() => {
+            cleanup();
+            resolve();
+        }, ms);
+        const onAbort = () => {
+            cleanup();
+            reject(createAbortError(signal, true));
+        };
+        const cleanup = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener?.('abort', onAbort);
+        };
+        signal?.addEventListener?.('abort', onAbort, { once: true });
+    });
 }
 
 // providerId -> { endpointBuilder, headersBuilder, bodyBuilder }
@@ -42,7 +77,6 @@ const PROVIDER_ADAPTERS = {
     openai: openaiAdapter,
     gptge: openaiAdapter,
     custom: openaiAdapter,
-    // Anthropic 兼容模式；需要 messages endpoint
     anthropic: {
         supportsStreaming: true,
         endpoint: (baseUrl) => `${trimSlash(baseUrl)}/messages`,
@@ -60,7 +94,7 @@ const PROVIDER_ADAPTERS = {
                 model,
                 system,
                 messages: userContent,
-                max_tokens: 512,
+                max_tokens: 8192,
                 stream: !!stream,
             };
         },
@@ -96,22 +130,65 @@ function normalizeProviderId(providerNameOrId) {
  * 根据模型 ID/元数据选择 provider 配置
  */
 export function resolveProviderForModel(modelId, availableModels = {}) {
-    // 先看 availableModels 中的 provider 字段
     for (const [pid, models] of Object.entries(availableModels)) {
         if (models?.some(m => m.id === modelId)) return pid;
     }
-    // 内置模型带 provider 名称
     const providerByName = normalizeProviderId(modelId);
     const providerExists = PROVIDERS.some(p => p.id === providerByName);
     return providerExists ? providerByName : 'custom';
 }
 
-function createTimeoutController(timeoutMs = REQUEST_TIMEOUT_MS) {
+function createAbortError(signal, cancelled = false) {
+    const err = new Error(cancelled ? 'LLM 请求已取消' : `LLM 请求超时（>${REQUEST_TIMEOUT_MS}ms）`);
+    err.name = cancelled ? 'AbortError' : 'TimeoutError';
+    err.code = cancelled ? LLM_ERROR.CANCELLED : LLM_ERROR.TIMEOUT;
+    err.cause = signal?.reason;
+    return err;
+}
+
+/**
+ * 合并外部 signal + 超时，任一触发即 abort
+ */
+export function createLinkedAbortController(externalSignal = null, timeoutMs = REQUEST_TIMEOUT_MS) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(new Error(`LLM 请求超时（>${timeoutMs}ms）`)), timeoutMs);
+    let timedOut = false;
+    let cancelled = false;
+
+    const timeoutId = setTimeout(() => {
+        timedOut = true;
+        try {
+            controller.abort(createAbortError(null, false));
+        } catch (_) { /* ignore */ }
+    }, timeoutMs);
+
+    const onExternalAbort = () => {
+        cancelled = true;
+        try {
+            controller.abort(externalSignal?.reason || createAbortError(externalSignal, true));
+        } catch (_) { /* ignore */ }
+    };
+
+    if (externalSignal) {
+        if (externalSignal.aborted) {
+            cancelled = true;
+            try {
+                controller.abort(externalSignal.reason || createAbortError(externalSignal, true));
+            } catch (_) { /* ignore */ }
+        } else {
+            externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+        }
+    }
+
     return {
         signal: controller.signal,
-        clear: () => clearTimeout(timeoutId),
+        clear() {
+            clearTimeout(timeoutId);
+            if (externalSignal) {
+                externalSignal.removeEventListener('abort', onExternalAbort);
+            }
+        },
+        wasCancelled: () => cancelled || !!(externalSignal && externalSignal.aborted && !timedOut),
+        wasTimedOut: () => timedOut,
     };
 }
 
@@ -119,7 +196,8 @@ function isSSEContentType(contentType = '') {
     return contentType.toLowerCase().includes('text/event-stream');
 }
 
-async function readStreamingResponse(res, adapter, onToken) {
+/** @internal 导出供测试验证 partial abort */
+export async function readStreamingResponse(res, adapter, onToken, signal) {
     if (!res.body) return '';
 
     const reader = res.body.getReader();
@@ -127,39 +205,69 @@ async function readStreamingResponse(res, adapter, onToken) {
     let buffer = '';
     let fullContent = '';
 
-    while (true) { // eslint-disable-line no-constant-condition
-        const { done, value } = await reader.read();
-        if (value) {
-            buffer += decoder.decode(value, { stream: !done });
-            const parts = buffer.split('\n\n');
-            buffer = parts.pop() || '';
-
-            for (const chunk of parts) {
-                const dataLines = chunk
-                    .split('\n')
-                    .map(line => line.trim())
-                    .filter(line => line.startsWith('data:'))
-                    .map(line => line.replace(/^data:\s*/, ''));
-
-                if (dataLines.length === 0) continue;
-                const dataStr = dataLines.join('\n').trim();
-                if (!dataStr || dataStr === '[DONE]') continue;
-
-                try {
-                    const json = JSON.parse(dataStr);
-                    const token = adapter.parseStreamEvent?.(json) || '';
-                    if (token) {
-                        fullContent += token;
-                        if (typeof onToken === 'function') onToken(token);
-                    }
-                } catch (_e) {
-                    // 忽略不完整事件或非 JSON 事件
-                }
-            }
+    const onAbort = () => {
+        try { reader.cancel(); } catch (_) { /* ignore */ }
+    };
+    if (signal) {
+        if (signal.aborted) {
+            onAbort();
+            throw createAbortError(signal, true);
         }
-        if (done) break;
+        signal.addEventListener('abort', onAbort, { once: true });
     }
 
+    try {
+        while (true) { // eslint-disable-line no-constant-condition
+            if (signal?.aborted) {
+                throw createAbortError(signal, true);
+            }
+            const { done, value } = await reader.read();
+            // cancel() 可能导致 read 以 done=true 正常返回；必须再次检查 abort
+            if (signal?.aborted) {
+                throw createAbortError(signal, true);
+            }
+            if (value) {
+                buffer += decoder.decode(value, { stream: !done });
+                const parts = buffer.split('\n\n');
+                buffer = parts.pop() || '';
+
+                for (const chunk of parts) {
+                    const dataLines = chunk
+                        .split('\n')
+                        .map(line => line.trim())
+                        .filter(line => line.startsWith('data:'))
+                        .map(line => line.replace(/^data:\s*/, ''));
+
+                    if (dataLines.length === 0) continue;
+                    const dataStr = dataLines.join('\n').trim();
+                    if (!dataStr || dataStr === '[DONE]') continue;
+
+                    try {
+                        const json = JSON.parse(dataStr);
+                        const token = adapter.parseStreamEvent?.(json) || '';
+                        if (token) {
+                            fullContent += token;
+                            if (typeof onToken === 'function') onToken(token);
+                        }
+                    } catch (_e) {
+                        // 忽略不完整事件或非 JSON 事件
+                    }
+                }
+            }
+            if (done) {
+                if (signal?.aborted) {
+                    throw createAbortError(signal, true);
+                }
+                break;
+            }
+        }
+    } finally {
+        signal?.removeEventListener?.('abort', onAbort);
+    }
+
+    if (signal?.aborted) {
+        throw createAbortError(signal, true);
+    }
     return fullContent;
 }
 
@@ -176,18 +284,34 @@ async function readJsonResponse(res, adapter) {
  * @param {Object} params.availableModels - 状态中的可用模型字典
  * @param {boolean} [params.stream=false] - 是否使用 SSE 流式
  * @param {(token:string)=>void} [params.onToken] - 流式回调
+ * @param {AbortSignal} [params.signal] - 外部取消信号（runner stop）
  * @returns {Promise<string>} LLM 回复内容
  */
-export async function sendChat({ model, messages, availableModels, stream = false, onToken, agentName = '', dispatch = null }) {
+export async function sendChat({
+    model,
+    messages,
+    availableModels,
+    stream = false,
+    onToken,
+    agentName = '',
+    dispatch = null,
+    signal = null,
+}) {
     const startTime = Date.now();
+    if (signal?.aborted) {
+        throw createAbortError(signal, true);
+    }
+
     const configs = await ensureProviderConfigsHydrated();
     const providerId = resolveProviderForModel(model, availableModels);
-    await throttle(providerId);
+    await throttle(providerId, signal);
     logger.debug('LLM', `sendChat: provider=${providerId}, model=${model}, stream=${stream}`);
     const config = configs[providerId] || configs.custom || {};
 
     if (!config.apiUrl || !config.apiKey) {
-        throw new Error(`Provider ${providerId} 未配置 API URL/Key`);
+        const err = new Error(`Provider ${providerId} 未配置 API URL/Key`);
+        err.code = LLM_ERROR.CONFIG;
+        throw err;
     }
 
     const adapter = PROVIDER_ADAPTERS[normalizeProviderId(providerId)] || PROVIDER_ADAPTERS.openai;
@@ -195,7 +319,7 @@ export async function sendChat({ model, messages, availableModels, stream = fals
     const headers = adapter.headers(config.apiKey);
     const requestStream = !!stream && !!adapter.supportsStreaming;
     const body = adapter.body({ model, messages, stream: requestStream });
-    const timeout = createTimeoutController();
+    const linked = createLinkedAbortController(signal, REQUEST_TIMEOUT_MS);
 
     let result = '';
     try {
@@ -203,18 +327,24 @@ export async function sendChat({ model, messages, availableModels, stream = fals
             method: 'POST',
             headers,
             body: JSON.stringify(body),
-            signal: timeout.signal,
+            signal: linked.signal,
         });
 
         if (!res.ok) {
             const text = await res.text();
-            logger.error('LLM', `API 失败 ${res.status}: ${text.slice(0, 200)}`);
-            throw new Error(`LLM 调用失败 ${res.status}: ${text.slice(0, 200)}`);
+            // 错误体可能含供应商回显的密钥片段 — 仅记录状态码与脱敏摘要
+            const safeSnippet = redactSensitive(String(text).slice(0, 120));
+            logger.error('LLM', `API 失败 ${res.status}: ${safeSnippet}`);
+            const err = new Error(`LLM 调用失败 ${res.status}`);
+            err.code = LLM_ERROR.HTTP;
+            err.status = res.status;
+            err.retryable = res.status >= 500 || res.status === 429;
+            throw err;
         }
 
         const contentType = res.headers.get('content-type') || '';
         if (requestStream && isSSEContentType(contentType)) {
-            result = await readStreamingResponse(res, adapter, onToken);
+            result = await readStreamingResponse(res, adapter, onToken, linked.signal);
         } else {
             if (requestStream) {
                 logger.warn('LLM', `请求了流式，但响应并非 SSE，已回退为非流式解析: provider=${providerId}, content-type=${contentType || 'unknown'}`);
@@ -222,21 +352,55 @@ export async function sendChat({ model, messages, availableModels, stream = fals
             result = await readJsonResponse(res, adapter);
         }
     } catch (err) {
-        if (err?.name === 'AbortError') {
-            throw new Error(`LLM 请求超时（>${REQUEST_TIMEOUT_MS}ms）`);
+        if (err?.code === LLM_ERROR.CANCELLED || err?.code === LLM_ERROR.TIMEOUT) {
+            throw err;
+        }
+        if (err?.name === 'AbortError' || linked.signal.aborted) {
+            if (linked.wasCancelled() || signal?.aborted) {
+                throw createAbortError(signal, true);
+            }
+            throw createAbortError(null, false);
         }
         throw err;
     } finally {
-        timeout.clear();
+        linked.clear();
     }
 
     const durationMs = Date.now() - startTime;
-    const inputText = messages.map(m => m.content).join('\n');
-    const logEntry = tokenTracker.record({ model, provider: providerId, agentName, inputText, outputText: result, durationMs });
+    // 日志/调试面板一律脱敏，避免验证码/Token 落盘
+    const inputText = redactSensitive(messages.map(m => m.content).join('\n'));
+    const outputText = redactSensitive(result);
+    const logEntry = tokenTracker.record({
+        model,
+        provider: providerId,
+        agentName,
+        inputText,
+        outputText,
+        durationMs,
+    });
     if (dispatch) {
-        dispatch({ type: 'ADD_PROMPT_LOG', payload: { ...logEntry, inputText, outputText: result } });
+        dispatch({
+            type: 'ADD_PROMPT_LOG',
+            payload: redactSensitiveDeep({ ...logEntry, inputText, outputText }),
+        });
     }
     return result;
 }
 
-export default { sendChat, resolveProviderForModel };
+export function isCancelError(err) {
+    return !!(err && (
+        err.code === LLM_ERROR.CANCELLED
+        || err.name === 'AbortError'
+        || /已取消|aborted|Abort/i.test(err.message || '')
+    ));
+}
+
+export function isTimeoutError(err) {
+    return !!(err && (
+        err.code === LLM_ERROR.TIMEOUT
+        || err.name === 'TimeoutError'
+        || /超时|timeout/i.test(err.message || '')
+    ));
+}
+
+export default { sendChat, resolveProviderForModel, createLinkedAbortController, isCancelError, isTimeoutError, LLM_ERROR };

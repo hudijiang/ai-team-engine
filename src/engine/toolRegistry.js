@@ -10,7 +10,9 @@ const BUILTIN_TOOLS = {
     current_time: {
         name: 'current_time',
         description: '获取当前日期和时间',
+        risk: 'read',
         parameters: {},
+        required: [],
         execute: async () => {
             const now = new Date();
             return `当前时间：${now.toLocaleString('zh-CN', { hour12: false })}，星期${['日', '一', '二', '三', '四', '五', '六'][now.getDay()]}`;
@@ -20,33 +22,54 @@ const BUILTIN_TOOLS = {
     calculator: {
         name: 'calculator',
         description: '计算数学表达式',
+        risk: 'read',
         parameters: { expression: { type: 'string', description: '数学表达式' } },
+        required: ['expression'],
         execute: async (params) => {
             try {
-                // 安全计算：仅允许数字和基本运算符
-                const expr = params.expression.replace(/[^0-9+\-*/().%\s]/g, '');
-                const result = Function('"use strict"; return (' + expr + ')')();
-                return `${params.expression} = ${result}`;
+                const raw = String(params.expression ?? '');
+                // 拒绝任何非数学字符，收窄 Function 攻击面
+                if (!/^[\d+\-*/().%\s]+$/.test(raw)) {
+                    return '计算错误：仅支持数字与 + - * / % ( ) 运算符';
+                }
+                const expr = raw.replace(/\s+/g, '');
+                if (!expr || expr.length > 200) {
+                    return '计算错误：表达式为空或过长';
+                }
+                if (/\*\*|\/\//.test(expr)) {
+                    return '计算错误：不支持 ** 或 //';
+                }
+                // eslint-disable-next-line no-new-func
+                const result = Function(`"use strict"; return (${expr});`)();
+                if (typeof result !== 'number' || !Number.isFinite(result)) {
+                    return '计算错误：结果不是有效数字';
+                }
+                return `${raw} = ${result}`;
             } catch (e) {
                 return `计算错误：${e.message}`;
             }
         },
     },
 
+    // 模拟搜索默认不注册到可调用列表（simulated: true，policy.allowSimulated 才暴露）
     web_search: {
         name: 'web_search',
-        description: '搜索互联网获取信息（模拟）',
+        description: '搜索互联网（模拟·默认禁用）',
+        risk: 'read',
+        simulated: true,
         parameters: { query: { type: 'string', description: '搜索关键词' } },
-        execute: async (params) => {
-            // 前端环境下无法直接调用搜索 API，返回提示
-            return `[搜索] 已搜索「${params.query}」- 这是前端模拟结果。实际部署需要后端搜索 API 支持。`;
+        required: ['query'],
+        execute: async () => {
+            throw new Error('模拟搜索已禁用：不得计入成功交付。请接入真实后端检索。');
         },
     },
 
     markdown_render: {
         name: 'markdown_render',
         description: '渲染 Markdown 文本为格式化预览',
+        risk: 'read',
         parameters: { content: { type: 'string', description: 'Markdown 内容' } },
+        required: ['content'],
         execute: async (params) => {
             return `[Markdown 预览]\n${params.content}`;
         },
@@ -55,28 +78,59 @@ const BUILTIN_TOOLS = {
     random_id: {
         name: 'random_id',
         description: '生成随机唯一标识符',
+        risk: 'read',
         parameters: {},
+        required: [],
         execute: async () => {
             return `生成的 ID：${crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)}`;
         },
     },
 };
 
-/** 自定义工具注册表 */
+/** 自定义工具注册表（禁止覆盖内置名） */
 const customTools = {};
 
 /**
  * 注册自定义工具
+ * @throws 若 name 与内置冲突
  */
 export function registerTool(name, definition) {
-    customTools[name] = { ...definition, name };
+    if (BUILTIN_TOOLS[name]) {
+        throw new Error(`禁止覆盖内置工具命名空间: ${name}`);
+    }
+    customTools[name] = {
+        ...definition,
+        name,
+        provenance: 'custom',
+        source: 'custom',
+    };
+}
+
+/**
+ * 注销自定义工具（测试用）
+ */
+export function unregisterTool(name) {
+    delete customTools[name];
 }
 
 /**
  * 获取所有可用工具
+ * 内置优先且不可被 custom 覆盖；内置带 provenance=builtin
  */
 export function getAllTools() {
-    return { ...BUILTIN_TOOLS, ...customTools };
+    const result = {};
+    for (const [key, def] of Object.entries(BUILTIN_TOOLS)) {
+        result[key] = { ...def, name: key, provenance: 'builtin', source: 'builtin' };
+    }
+    for (const [key, def] of Object.entries(customTools)) {
+        if (result[key]) continue; // 永不覆盖内置
+        result[key] = { ...def, name: key, provenance: def.provenance || 'custom', source: def.source || 'custom' };
+    }
+    return result;
+}
+
+export function getBuiltinToolNames() {
+    return Object.keys(BUILTIN_TOOLS);
 }
 
 /**

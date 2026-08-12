@@ -226,7 +226,10 @@ export default function ModelConfigPanel() {
             })}
 
             <div className="model-config-panel__note">
-                🔒 API Key 仅持久化在浏览器本地（bootstrap cache + IndexedDB），不会上传到任何服务器。
+                🔒 API Key 默认仅保存在本机浏览器（localStorage 去敏 bootstrap + IndexedDB）。
+                调用模型时，浏览器会<strong>直连你配置的模型供应商 API</strong>，密钥会出现在出站请求中——并非「从不离开设备」。
+                对话内容、Prompt 日志也可能发送给所选供应商。商用环境请改用自托管 LLM Gateway，勿在共享设备保存密钥。
+                标注「实验」的供应商表示原生协议未验证，仅兼容代理可用。
             </div>
         </div>
     );

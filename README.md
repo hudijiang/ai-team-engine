@@ -197,5 +197,21 @@ npm run check
 - **Agent 自我进化**：基于性能评估数据自动调整 Prompt 策略和模型选配。
 - **可视化工作流编辑器**：拖拽式编排 Agent 协作流程，降低使用门槛。
 
+## ⚠️ 产品定位与商用边界
+
+本项目当前适合：**本地单用户 / 内部 PoC / BYOK 技术预览**。
+
+**不建议**在未完成后端控制平面前对外收费，也**不能**承诺企业级安全、审计或 SLA。
+
+已知边界包括：
+
+- 浏览器直连模型供应商，API Key 与 Prompt 会离开本机发往你配置的 endpoint
+- 工具默认仅允许只读内置工具；MCP 等高风险调用默认拒绝
+- 执行结果已引入 success/failed/skipped 等状态，模板回退不再计为成功
+- 无多租户、无服务端任务队列、无密钥托管
+
+详见 [PRIVACY.md](./PRIVACY.md)、[DEPLOYMENT.md](./DEPLOYMENT.md)。
+
 ## 📄 协议
-目前作为概念可行性（PoC）验证项目内部使用。
+
+MIT License，见 [LICENSE](./LICENSE)。目前仍以 PoC / 技术预览方式使用。

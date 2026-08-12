@@ -3,6 +3,19 @@
  * 开发环境下通过 /api/log 写入服务端文件
  * 生产环境下仅 console 输出
  */
+import { redactSensitive, redactSensitiveDeep } from './sensitiveData.js';
+
+function sanitizeLogValue(value) {
+    if (typeof value === 'string') return redactSensitive(value);
+    if (value instanceof Error) {
+        return {
+            name: redactSensitive(value.name || 'Error'),
+            message: redactSensitive(value.message || ''),
+            stack: redactSensitive(value.stack || ''),
+        };
+    }
+    return redactSensitiveDeep(value);
+}
 
 const LOG_BUFFER = [];
 const FLUSH_INTERVAL = 2000;
@@ -40,11 +53,15 @@ function ensureTimer() {
  * @param {string|object} message
  */
 function log(level, tag, message) {
+    // Logger 是公共出口：调用方即使忘记脱敏，也不能把凭据写入
+    // console、开发日志缓冲区或服务端日志文件。
+    const safeTag = redactSensitive(String(tag || 'Log'));
+    const safeMessage = sanitizeLogValue(message);
     const entry = {
         timestamp: new Date().toISOString(),
         level,
-        tag,
-        message,
+        tag: safeTag,
+        message: safeMessage,
         sessionId: currentSessionId,
     };
 
@@ -53,7 +70,7 @@ function log(level, tag, message) {
         : level === 'WARN' ? console.warn
             : level === 'DEBUG' ? console.debug
                 : console.log;
-    consoleFn(`[${tag}]`, message);
+    consoleFn(`[${safeTag}]`, safeMessage);
 
     // 开发环境下缓冲写文件
     if (isDevRuntime) {
@@ -77,7 +94,7 @@ const logger = {
     flush, // 手动刷写
     /** 开始新会话，后续日志写入独立文件 */
     startSession(id) {
-        currentSessionId = id || `session-${Date.now()}`;
+        currentSessionId = redactSensitive(String(id || `session-${Date.now()}`));
         log('INFO', 'Session', `=== 新会话开始: ${currentSessionId} ===`);
         return currentSessionId;
     },

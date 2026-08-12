@@ -1,4 +1,5 @@
 import { CEOAgentRunner } from './ceoAgent.js';
+import { ABORT_REASON } from './executionControl.js';
 
 let activeRunner = null;
 
@@ -17,7 +18,7 @@ export function getRunner(dispatch, getState) {
 
 export function replaceRunner(dispatch, getState) {
     if (activeRunner) {
-        activeRunner.stop();
+        activeRunner.stop(ABORT_REASON.RESET);
     }
     activeRunner = new CEOAgentRunner(dispatch, getState);
     return activeRunner;
@@ -29,7 +30,7 @@ export function peekRunner() {
 
 export function clearRunner() {
     if (activeRunner) {
-        activeRunner.stop();
+        activeRunner.stop(ABORT_REASON.STOPPED);
         activeRunner = null;
     }
 }
