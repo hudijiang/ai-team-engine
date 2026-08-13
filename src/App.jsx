@@ -14,6 +14,7 @@ import PluginPanel from './components/PluginPanel';
 import GatewayRunsPanel from './components/GatewayRunsPanel';
 import useInboxSubscriber from './hooks/useInboxSubscriber';
 import CommandInput from './components/CommandInput';
+import ReadinessBar from './components/ReadinessBar';
 import { useStore } from './store/store';
 import { clearRunner } from './engine/runnerRuntime';
 
@@ -108,6 +109,20 @@ export default function App() {
                         {statusText[systemStatus] || systemStatus}
                     </span>
                 </div>
+                <ReadinessBar
+                    onNavigate={(tab) => {
+                        if (tab === 'agents') {
+                            setLeftCollapsed(false);
+                            setLeftTab('agents');
+                            return;
+                        }
+                        if (tab === 'config') {
+                            setRightCollapsed(false);
+                            setRightTab('config');
+                            setShowMoreTabs(false);
+                        }
+                    }}
+                />
             </header>
 
             {/* 主布局 */}

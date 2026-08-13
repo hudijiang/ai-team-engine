@@ -438,13 +438,15 @@ body {
 /* --- 头部 --- */
 .app-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   padding: var(--space-md) var(--space-xl);
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-primary);
-  height: 60px;
+  min-height: 60px;
   flex-shrink: 0;
+  gap: 8px;
 }
 
 .app-header__logo {
@@ -485,6 +487,44 @@ body {
   display: flex;
   align-items: center;
   gap: var(--space-sm);
+}
+
+.readiness-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding-top: 2px;
+}
+
+.readiness-chip {
+  border: 1px solid var(--border-primary);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  padding: 2px 10px;
+}
+
+.readiness-chip--ok {
+  border-color: rgba(16, 185, 129, 0.4);
+  color: var(--accent-emerald);
+}
+
+.readiness-chip--warn {
+  border-color: rgba(245, 158, 11, 0.45);
+  color: var(--accent-amber);
+}
+
+.readiness-chip--action {
+  cursor: pointer;
+}
+
+.readiness-chip--action:hover {
+  border-color: var(--border-active);
+  color: var(--text-primary);
 }
 
 .status-badge {

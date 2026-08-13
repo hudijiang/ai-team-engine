@@ -10,6 +10,7 @@ import {
     submitHumanInputAction,
 } from './commandInputActions.js';
 import { restoreConfigCheckpoint, submitObjectiveCommand } from './commandInputLogic.js';
+import { getGatewayRun } from '../engine/gatewayRuns.js';
 
 /**
  * 董事长指令输入组件
@@ -23,6 +24,7 @@ export default function CommandInput() {
     const systemStatus = useStore(s => s.systemStatus);
     const workflowCheckpoint = useStore(s => s.workflowCheckpoint);
     const agents = useStore(s => s.agents) || [];
+    const gatewayRunId = useStore(s => s.gatewayRunId);
 
     const isRunning = systemStatus === 'running';
     const isCompleted = systemStatus === 'completed';
@@ -49,6 +51,7 @@ export default function CommandInput() {
         : '';
 
     const [humanInput, setHumanInput] = useState('');
+    const [blockedReason, setBlockedReason] = useState('');
     const ceoHasModel = agents.some(agent => agent.name === 'CEO' && !!agent.model);
     const teamMissingModels = agents.filter(agent => agent.name !== 'CEO' && !agent.model);
     const canStartWithModels = teamMissingModels.length === 0;
@@ -62,6 +65,18 @@ export default function CommandInput() {
             getRunnerImpl: getRunner,
         });
     }, [systemStatus, workflowCheckpoint, dispatch, getSnapshot]);
+
+    useEffect(() => {
+        if (systemStatus !== 'blocked' || !gatewayRunId) {
+            setBlockedReason('');
+            return undefined;
+        }
+        let active = true;
+        void getGatewayRun(gatewayRunId).then(record => {
+            if (active) setBlockedReason(record?.lastError || '');
+        });
+        return () => { active = false; };
+    }, [systemStatus, gatewayRunId]);
 
     const handleSubmit = useCallback(() => {
         const result = submitObjectiveCommand({
@@ -162,7 +177,7 @@ export default function CommandInput() {
             {isWaitingHuman && (
                 <div className="command-input__config-notice">
                     <div className="command-input__config-text" style={{ color: 'var(--accent-amber)' }}>
-                        🚨 团队在执行(如登录、验证码等)时遇到障碍，请求董事长协助。
+                        🚨 需要你在外部完成登录/支付等操作。确认后输入「已完成」，或点跳过（不计成功）。
                     </div>
                     <div className="command-input__wrapper" style={{ marginTop: '8px', paddingBottom: '4px' }}>
                         <input
@@ -173,7 +188,7 @@ export default function CommandInput() {
                             onKeyDown={e => {
                                 if (e.key === 'Enter') handleHumanSubmit();
                             }}
-                            placeholder="输入验证结果/协助内容..."
+                            placeholder="外部完成后输入「已完成」，不要粘贴验证码"
                             id="human-input-field"
                         />
                         <button
@@ -227,7 +242,7 @@ export default function CommandInput() {
             {isBlocked && (
                 <div className="command-input__config-notice" style={{ borderColor: 'rgba(239,68,68,0.4)' }}>
                     <div className="command-input__config-text" style={{ color: 'var(--accent-red)' }}>
-                        ⚠️ 调度检测到依赖无法满足，流程已暂停。请检查任务拆解，或点击下方重置后重新发布目标。
+                        ⚠️ {blockedReason || '流程已阻塞。请查看上方就绪条或右侧「运行」里的失败原因，也可重置后重发。'}
                     </div>
                     <div className="command-input__config-actions">
                         <button

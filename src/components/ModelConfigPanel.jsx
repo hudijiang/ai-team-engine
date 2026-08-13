@@ -26,7 +26,7 @@ import {
     isGatewayEnabled,
     saveGatewayConfig,
 } from '../engine/gatewayConfig.js';
-import { listGatewayModels, listGatewayProviders } from '../engine/gatewayRuns.js';
+import { listGatewayModels, listGatewayProviders, probeGateway } from '../engine/gatewayRuns.js';
 import { getKnownProvider } from '../engine/providerCatalog.js';
 
 /**
@@ -46,6 +46,8 @@ export default function ModelConfigPanel() {
     const [gateway, setGateway] = useState({ useGateway: false, gatewayUrl: '', accessToken: '' });
     const [gatewayProviders, setGatewayProviders] = useState([]);
     const [manualModelIds, setManualModelIds] = useState({});
+    const [probeResult, setProbeResult] = useState(null);
+    const [probing, setProbing] = useState(false);
     const gatewayTimerRef = useRef(null);
 
     // 初始化：加载 API 配置 + 恢复模型缓存
@@ -346,6 +348,36 @@ export default function ModelConfigPanel() {
                                 gatewayTimerRef.current = setTimeout(() => saveGatewayConfig(next), 300);
                             }}
                         />
+                        <div className="model-config-item__actions">
+                            <button
+                                className="model-config-item__fetch"
+                                disabled={probing}
+                                onClick={async () => {
+                                    setProbing(true);
+                                    try {
+                                        saveGatewayConfig(gateway);
+                                        setProbeResult(await probeGateway(gateway));
+                                    } finally {
+                                        setProbing(false);
+                                    }
+                                }}
+                            >
+                                {probing ? '检测中…' : '检测 Gateway'}
+                            </button>
+                            {probeResult && (
+                                <span className="text-sm text-muted">
+                                    {probeResult.reason === null && probeResult.ok
+                                        ? `已连接，${probeResult.configuredCount} 个供应商有 Key`
+                                        : probeResult.reason === 'no_provider_key'
+                                            ? '已连接，但进程里还没有 OPENAI_API_KEY 等'
+                                            : probeResult.reason === 'unreachable'
+                                                ? '连不上，请先 npm run gateway'
+                                                : probeResult.reason === 'unauthorized'
+                                                    ? 'Token 不对'
+                                                    : '请先填 URL 和 Token'}
+                                </span>
+                            )}
+                        </div>
                     </div>
                 )}
             </div>

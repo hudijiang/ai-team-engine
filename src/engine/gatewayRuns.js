@@ -118,6 +118,33 @@ export function exportGatewayRuns(records = []) {
     }, null, 2);
 }
 
+export async function probeGateway(configOverride = null) {
+    const config = configOverride || await ensureGatewayConfigHydrated();
+    if (!config.useGateway) {
+        return { mode: 'direct', ok: true, reason: null, configuredCount: 0, providers: [] };
+    }
+    if (!config.gatewayUrl || !config.accessToken) {
+        return { mode: 'gateway', ok: false, reason: 'missing_config', configuredCount: 0, providers: [] };
+    }
+    const health = await gatewayFetch('/health', {}, 3000, config);
+    if (!health) {
+        return { mode: 'gateway', ok: false, reason: 'unreachable', configuredCount: 0, providers: [] };
+    }
+    const providersRes = await gatewayFetch('/api/providers', {}, 3000, config);
+    if (!providersRes) {
+        return { mode: 'gateway', ok: false, reason: 'unreachable', configuredCount: 0, providers: [] };
+    }
+    if (!providersRes.ok) {
+        return { mode: 'gateway', ok: false, reason: 'unauthorized', configuredCount: 0, providers: [] };
+    }
+    const providers = Array.isArray(providersRes.data?.providers) ? providersRes.data.providers : [];
+    const configuredCount = providers.filter(item => item.configured).length;
+    if (configuredCount === 0) {
+        return { mode: 'gateway', ok: true, reason: 'no_provider_key', configuredCount, providers };
+    }
+    return { mode: 'gateway', ok: true, reason: null, configuredCount, providers };
+}
+
 export async function listGatewayProviders(config = null, options = {}) {
     const res = await gatewayFetch('/api/providers', {}, options.timeoutMs, config);
     if (!res?.ok) return [];
@@ -147,5 +174,6 @@ export default {
     listGatewayModels,
     deleteGatewayRun,
     exportGatewayRuns,
+    probeGateway,
     gatewayFetch,
 };
