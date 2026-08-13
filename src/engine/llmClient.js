@@ -1,7 +1,7 @@
 /**
  * LLM 客户端
  * 基于用户在 ModelConfigPanel 中保存的 provider 配置，调用 OpenAI/Anthropic 兼容接口
- * 仅在浏览器侧发起 fetch；不在服务端存储任何密钥。
+ * 默认浏览器直连供应商；若开启单租户 Gateway，则只带 Gateway Token，raw key 留在 Gateway 进程。
  *
  * 支持：
  * - 外部 AbortSignal（runner stop / 重置）
@@ -9,6 +9,7 @@
  * - SSE 流式读取可中断
  */
 import { ensureProviderConfigsHydrated, PROVIDERS } from './modelConfig.js';
+import { ensureGatewayConfigHydrated, isGatewayEnabled } from './gatewayConfig.js';
 import tokenTracker from './tokenTracker.js';
 import logger from '../utils/logger.js';
 import { redactSensitive, redactSensitiveDeep } from '../utils/sensitiveData.js';
@@ -276,6 +277,102 @@ async function readJsonResponse(res, adapter) {
     return adapter.parse(data) || '';
 }
 
+async function sendChatViaGateway({
+    gateway,
+    model,
+    messages,
+    availableModels,
+    onToken,
+    agentName,
+    dispatch,
+    signal,
+    startTime,
+}) {
+    const providerId = resolveProviderForModel(model, availableModels);
+    await throttle(providerId, signal);
+    logger.debug('LLM', `sendChat via gateway: provider=${providerId}, model=${model}`);
+
+    const linked = createLinkedAbortController(signal, REQUEST_TIMEOUT_MS);
+    let result = '';
+    try {
+        const res = await fetch(`${gateway.gatewayUrl}/api/llm/chat`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${gateway.accessToken}`,
+            },
+            body: JSON.stringify({
+                provider: providerId,
+                model,
+                messages,
+                stream: false,
+            }),
+            signal: linked.signal,
+        });
+
+        if (!res.ok) {
+            const text = await res.text();
+            const safeSnippet = redactSensitive(String(text).slice(0, 120));
+            logger.error('LLM', `Gateway 失败 ${res.status}: ${safeSnippet}`);
+            const err = new Error(`LLM Gateway 调用失败 ${res.status}`);
+            err.code = LLM_ERROR.HTTP;
+            err.status = res.status;
+            err.retryable = res.status >= 500 || res.status === 429;
+            throw err;
+        }
+
+        const data = await res.json();
+        result = data?.content || '';
+        if (result && typeof onToken === 'function') {
+            onToken(result);
+        }
+    } catch (err) {
+        if (err?.code === LLM_ERROR.CANCELLED || err?.code === LLM_ERROR.TIMEOUT) {
+            throw err;
+        }
+        if (err?.name === 'AbortError' || linked.signal.aborted) {
+            if (linked.wasCancelled() || signal?.aborted) {
+                throw createAbortError(signal, true);
+            }
+            throw createAbortError(null, false);
+        }
+        throw err;
+    } finally {
+        linked.clear();
+    }
+
+    return finalizeChatLog({
+        model,
+        providerId,
+        agentName,
+        dispatch,
+        messages,
+        result,
+        startTime,
+    });
+}
+
+function finalizeChatLog({ model, providerId, agentName, dispatch, messages, result, startTime }) {
+    const durationMs = Date.now() - startTime;
+    const inputText = redactSensitive(messages.map(m => m.content).join('\n'));
+    const outputText = redactSensitive(result);
+    const logEntry = tokenTracker.record({
+        model,
+        provider: providerId,
+        agentName,
+        inputText,
+        outputText,
+        durationMs,
+    });
+    if (dispatch) {
+        dispatch({
+            type: 'ADD_PROMPT_LOG',
+            payload: redactSensitiveDeep({ ...logEntry, inputText, outputText }),
+        });
+    }
+    return result;
+}
+
 /**
  * 发送一次对话请求
  * @param {Object} params
@@ -300,6 +397,21 @@ export async function sendChat({
     const startTime = Date.now();
     if (signal?.aborted) {
         throw createAbortError(signal, true);
+    }
+
+    const gateway = await ensureGatewayConfigHydrated();
+    if (isGatewayEnabled(gateway)) {
+        return sendChatViaGateway({
+            gateway,
+            model,
+            messages,
+            availableModels,
+            onToken,
+            agentName,
+            dispatch,
+            signal,
+            startTime,
+        });
     }
 
     const configs = await ensureProviderConfigsHydrated();
@@ -366,25 +478,15 @@ export async function sendChat({
         linked.clear();
     }
 
-    const durationMs = Date.now() - startTime;
-    // 日志/调试面板一律脱敏，避免验证码/Token 落盘
-    const inputText = redactSensitive(messages.map(m => m.content).join('\n'));
-    const outputText = redactSensitive(result);
-    const logEntry = tokenTracker.record({
+    return finalizeChatLog({
         model,
-        provider: providerId,
+        providerId,
         agentName,
-        inputText,
-        outputText,
-        durationMs,
+        dispatch,
+        messages,
+        result,
+        startTime,
     });
-    if (dispatch) {
-        dispatch({
-            type: 'ADD_PROMPT_LOG',
-            payload: redactSensitiveDeep({ ...logEntry, inputText, outputText }),
-        });
-    }
-    return result;
 }
 
 export function isCancelError(err) {

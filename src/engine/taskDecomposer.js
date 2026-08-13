@@ -76,7 +76,7 @@ ${roleDescriptions}
 
 ${pluginRolePrompt ? `${pluginRolePrompt}\n` : ''}
 
-${knowledgeContext ? `## 企业知识库参考\n${knowledgeContext}\n` : ''}
+${knowledgeContext ? `## 本地知识库参考（关键词检索）\n${knowledgeContext}\n` : ''}
 
 ## 你的任务
 分析用户的战略目标，然后：

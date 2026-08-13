@@ -147,7 +147,7 @@ export function formatRAGContext(query) {
         `[参考 ${i + 1}] ${r.content.slice(0, 300)}`
     );
 
-    return `\n### 知识库参考\n以下是从企业知识库中检索到的相关内容：\n${lines.join('\n\n')}\n`;
+    return `\n### 知识库参考\n以下是从本地关键词知识库中检索到的相关内容（非向量 RAG）：\n${lines.join('\n\n')}\n`;
 }
 
 /**

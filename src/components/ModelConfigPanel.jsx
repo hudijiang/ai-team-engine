@@ -20,6 +20,10 @@ import {
     integrateFetchedProviderModels,
     integrateProviderFetchError,
 } from './modelConfigPanelActions.js';
+import {
+    ensureGatewayConfigHydrated,
+    saveGatewayConfig,
+} from '../engine/gatewayConfig.js';
 
 /**
  * 模型配置面板
@@ -35,6 +39,8 @@ export default function ModelConfigPanel() {
     const saveTimerRef = useRef(null);
     const latestConfigsRef = useRef({});
     const lastConfigMutationAtRef = useRef(0);
+    const [gateway, setGateway] = useState({ useGateway: false, gatewayUrl: '', accessToken: '' });
+    const gatewayTimerRef = useRef(null);
 
     // 初始化：加载 API 配置 + 恢复模型缓存
     useEffect(() => {
@@ -60,6 +66,8 @@ export default function ModelConfigPanel() {
             if (Object.keys(restoredFetchResults).length > 0) {
                 setFetchResults(restoredFetchResults);
             }
+            const gw = await ensureGatewayConfigHydrated();
+            if (active) setGateway(gw);
         };
 
         void restorePersistedState();
@@ -225,10 +233,53 @@ export default function ModelConfigPanel() {
                 );
             })}
 
+            <div className="model-config-item" style={{ marginTop: 16 }}>
+                <label className="model-config-item__header">
+                    <input
+                        type="checkbox"
+                        checked={!!gateway.useGateway}
+                        onChange={(e) => {
+                            const next = { ...gateway, useGateway: e.target.checked };
+                            setGateway(next);
+                            clearTimeout(gatewayTimerRef.current);
+                            gatewayTimerRef.current = setTimeout(() => saveGatewayConfig(next), 300);
+                        }}
+                    />
+                    {' '}使用本机单租户 Gateway（推荐：浏览器不再持有供应商 raw key）
+                </label>
+                {gateway.useGateway && (
+                    <div className="model-config-item__body">
+                        <input
+                            className="model-config-item__input"
+                            placeholder="Gateway URL，如 http://127.0.0.1:8787"
+                            value={gateway.gatewayUrl}
+                            onChange={(e) => {
+                                const next = { ...gateway, gatewayUrl: e.target.value };
+                                setGateway(next);
+                                clearTimeout(gatewayTimerRef.current);
+                                gatewayTimerRef.current = setTimeout(() => saveGatewayConfig(next), 300);
+                            }}
+                        />
+                        <input
+                            className="model-config-item__input"
+                            type="password"
+                            placeholder="GATEWAY_TOKEN"
+                            value={gateway.accessToken}
+                            onChange={(e) => {
+                                const next = { ...gateway, accessToken: e.target.value };
+                                setGateway(next);
+                                clearTimeout(gatewayTimerRef.current);
+                                gatewayTimerRef.current = setTimeout(() => saveGatewayConfig(next), 300);
+                            }}
+                        />
+                    </div>
+                )}
+            </div>
+
             <div className="model-config-panel__note">
-                🔒 API Key 默认仅保存在本机浏览器（localStorage 去敏 bootstrap + IndexedDB）。
-                调用模型时，浏览器会<strong>直连你配置的模型供应商 API</strong>，密钥会出现在出站请求中——并非「从不离开设备」。
-                对话内容、Prompt 日志也可能发送给所选供应商。商用环境请改用自托管 LLM Gateway，勿在共享设备保存密钥。
+                🔒 默认：API Key 在本机 IndexedDB（localStorage 仅去敏 bootstrap）。
+                直连模式下<strong>浏览器</strong>会把密钥发到你填写的模型 URL。
+                开启上方 Gateway 后，浏览器只带 Gateway Token，供应商密钥留在本机 Gateway 进程。
                 标注「实验」的供应商表示原生协议未验证，仅兼容代理可用。
             </div>
         </div>

@@ -1,6 +1,12 @@
 /**
- * MCP (Model Context Protocol) 客户端
- * 前端抽象层 — 通过 SSE/HTTP 连接 MCP Server
+ * 外部工具桥（名义上的「MCP」配置项）
+ *
+ * 当前**不是**官方 Model Context Protocol：
+ * - 仅约定两个 HTTP JSON 接口：GET `/tools/list`、POST `/tools/call`
+ * - 没有 JSON-RPC、没有 MCP SSE/stdio transport、没有 initialize 握手
+ * - 发现到的工具 provenance=mcp，默认 high_risk，策略未放行则不会执行
+ *
+ * 用于本地 PoC 对接自建 HTTP 工具网关；勿当作完整 MCP Client。
  */
 import { createPersistentResource } from '../utils/persistentResource.js';
 
@@ -83,7 +89,6 @@ export class MCPClient {
             const headers = { 'Content-Type': 'application/json' };
             if (this.authToken) headers['Authorization'] = `Bearer ${this.authToken}`;
 
-            // 注意：此实现为简化 HTTP 示意，非完整 MCP 标准协议
             const res = await fetch(`${this.serverUrl}/tools/list`, {
                 headers,
                 signal: controller.signal,

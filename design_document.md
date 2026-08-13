@@ -18,7 +18,7 @@ AI Team Engine 是一个将**现代企业治理结构**（董事长 → CEO → 
 | **企业治理隐喻** | 三级权限分离（董事长/CEO/员工），职责清晰、不可越权 |
 | **安全感优先** | HITL（Human-in-the-loop）机制，敏感操作强制暂停等待人工确认 |
 | **透明可审计** | 所有 Agent 通信全局可见，支持 JSON 结构化数据展开 |
-| **零后端依赖** | 纯前端架构，API Key 仅存 localStorage，直连各大模型 API |
+| **零后端依赖** | 纯前端架构；完整密钥与会话在 IndexedDB，localStorage 仅去敏 bootstrap；浏览器直连你配置的模型 URL |
 | **语义驱动编排** | 基于关键词积分匹配的智能任务拆解，非硬编码模板绑定 |
 
 ---
@@ -140,7 +140,7 @@ src/
 │   ├── agentEngine.js          # Agent 工厂 + 状态枚举 + 对话模板 + 模型列表
 │   ├── llmClient.js            # LLM 客户端（OpenAI/Anthropic 兼容 + SSE 流式）
 │   ├── messageBus.js           # 发布/订阅消息总线（单例，Agent 间通信）
-│   └── modelConfig.js          # 9 大供应商配置 + localStorage 持久化 + 模型缓存
+│   └── modelConfig.js          # 供应商配置 + IndexedDB 密钥 + localStorage bootstrap
 │
 ├── hooks/
 │   └── useInboxSubscriber.js   # 监听 messageBus 广播，自动写入 inbox store
@@ -314,7 +314,7 @@ CEO 在创建团队成员时，根据角色名称中的关键词自动匹配最�
 
 ### 4.5 HITL 人工介入机制
 
-系统内置运行时安全拦截器，通过 Promise 挂起/恢复模式实现全流程无缝人工接管。
+运行时安全拦截：**关键词/角色命中 → 立即拦截**；未命中则 **LLM 判 YES/NO**；无模型、返回不可解析或调用失败 → **fail-closed 要求介入**。挂起仍用 Promise + generation 门禁。HITL 输入默认不注入 Prompt 原文。
 
 ```mermaid
 sequenceDiagram
@@ -323,19 +323,17 @@ sequenceDiagram
     participant UI as 前端 UI
     participant Chairman as 董事长
 
-    Agent->>CEO: 执行子任务「注册账号」
-    CEO->>CEO: 检测到敏感关键词「注册」
+    Agent->>CEO: 准备执行子任务
+    CEO->>CEO: 关键词命中或 LLM YES / 判断失败
     CEO->>UI: dispatch(SET_STATUS, waiting_for_human)
-    CEO->>CEO: new Promise(resolve => pendingHumanInput = resolve) — 挂起
-    UI->>Chairman: 显示红色告警面板
-    Chairman->>UI: 输入验证码「123456」
-    UI->>CEO: provideHumanInput("123456")
-    CEO->>CEO: resolve("123456") — 恢复执行
-    CEO->>Agent: 继续后续子任务
+    CEO->>CEO: Promise + gateGeneration 挂起
+    UI->>Chairman: 告警面板（勿粘贴真实验证码）
+    Chairman->>UI: 外部完成后确认或显式跳过
+    UI->>CEO: provideHumanInput / skip
+    CEO->>CEO: promote 检查点后恢复（跳过不计成功）
 ```
 
-**敏感词触发列表**（位于 `_executeAgentPhase`）：
-`登录` | `验证码` | `扫码` | `确认账号` | `支付` | `人脸` | `绑定`
+关键词表见 `src/utils/sensitiveData.js` 的 `HIGH_RISK_HITL_PATTERN`（中英混合）。英文绕写仍可能漏拦。
 
 ### 4.6 LLM 客户端 (`llmClient.js`)
 
@@ -391,7 +389,7 @@ LLM 调用失败时，自动回退到 `DIALOGUE_TEMPLATES` 模板输出（定义
 | 智谱AI (GLM) | `zhipu` | `https://open.bigmodel.cn/api/paas/v4` |
 | 自定义 | `custom` | 用户自填 |
 
-**持久化**：`localStorage` 存储 API URL/Key，模型列表有 5 分钟缓存（`MODELS_CACHE_KEY`）。
+**持久化**：完整 API URL/Key 在 IndexedDB；`localStorage` 仅去敏 bootstrap。模型列表缓存见 `MODELS_CACHE_KEY`。
 
 ---
 
@@ -515,11 +513,11 @@ LLM 调用失败时，自动回退到 `DIALOGUE_TEMPLATES` 模板输出（定义
 
 | 项目 | 策略 |
 |------|------|
-| API Key 存储 | 仅 `localStorage`，不上传任何服务器 |
-| 网络请求 | 浏览器直连模型 API，无中间代理 |
-| 敏感操作 | HITL 拦截词库自动暂停 |
-| 错误处理 | ErrorBoundary 防白屏 + LLM 降级模板 |
-| 中止机制 | `_aborted` 标志 + timer 清理，stop 后 async 链立即终止 |
+| API Key 存储 | IndexedDB 存完整密钥；localStorage 仅去敏 bootstrap |
+| 网络请求 | 浏览器直连你填写的 URL（密钥/Prompt 外泄、恶意代理、本机/内网访问）。非服务端 SSRF |
+| 敏感操作 | 关键词立即拦 + LLM YES/NO；失败 fail-closed。凭据不进 Prompt 原文 |
+| 错误处理 | ErrorBoundary + 类型化失败（模板不计成功） |
+| 中止机制 | Abort 作用域 + gate generation + 门禁互斥；stop 取消 LLM/SSE |
 
 ---
 
@@ -529,20 +527,19 @@ LLM 调用失败时，自动回退到 `DIALOGUE_TEMPLATES` 模板输出（定义
 
 | 局限 | 说明 |
 |------|------|
-| 模拟执行 | `_delay(ms) + Math.random()` 模拟时间线，非真实 Agent 推理 |
-| 单向依赖 | 任务依赖仅支持线性/树形 DAG，不支持动态依赖变更 |
-| 无持久化 | 执行结果仅存于内存，刷新即丢失 |
-| 无并发执行 | 依赖满足的任务是串行 `for..of` 而非真正并行 |
-| 固定拦截词 | HITL 触发词硬编码，缺乏用户自定义 |
+| 无控制平面 | 无 Gateway；执行随标签页结束。密钥在浏览器 |
+| 检查点有限 | 有 running/门禁检查点，但不是服务端持久任务 |
+| 依赖图 | 阶段依赖 DAG；同 assignee 串行。不支持运行中改边 |
+| HITL 覆盖 | 关键词 + LLM；英文绕写可能漏。规则不可配置 |
+| 外部工具 | 「MCP」仅为 `/tools/list` + `/tools/call` HTTP，非标准协议 |
 
 ### 8.2 演进路线
 
 | 阶段 | 计划 |
 |------|------|
-| **P0 — 真实 LLM 接入** | 将 `_delay` 模拟替换为 `llmClient.sendChat` 真实调用，Agent 输出由 LLM 驱动 |
-| **P1 — WebSocket 通信** | `messageBus.js` 升级为 WebSocket 后端双向通信 |
-| **P2 — 成果导出** | 支持执行履历和 Agent 产出物导出为 Markdown/JSON 文件 |
-| **P3 — 执行中断与重组** | 董事长在运行中强制中断、重新分配角色或修改任务 |
-| **P4 — 真并发调度** | 无依赖关系的任务 `Promise.all` 并行执行 |
+| **P0 — 单租户控制平面** | 最小 Gateway：密钥托管、代调模型、会话持久、审计、限流；并行增量拆 `ceoAgent.js` |
+| **P0 — 主路径 E2E** | Playwright + 可选真实供应商烟雾测试 |
+| **P1 — 工具运行时** | 沙箱 / 标准 MCP，替代简化 HTTP 桥 |
+| **P2 — 多租户** | 隔离与账单（单租户稳定之后，非当前 P0） |
 | **P5 — 可配置拦截规则** | HITL 触发词从硬编码改为用户可视化配置 |
 | **P6 — 多轮对话上下文** | Agent 间通信保持上下文累积，支持多轮协作对话 |

@@ -30,6 +30,7 @@ import {
     selectParallelReadyTasks,
     shouldMarkPhaseComplete,
 } from './executionControl.js';
+import { createGateController } from './gateController.js';
 import { recordTimelineEvent, clearTimelineEvents } from './timelineRecorder.js';
 import {
     buildRunningExecutionCheckpoint,
@@ -54,6 +55,7 @@ import {
     redactSensitive,
 } from '../utils/sensitiveData.js';
 import { DEFAULT_TOOL_POLICY } from './capabilityRuntime.js';
+import { createGatewayRun } from './gatewayRuns.js';
 
 const DEFAULT_DEPENDENCIES = Object.freeze({
     decomposeWithLLM,
@@ -68,6 +70,7 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
     formatMemoryContext,
     saveMemory,
     recordPerformance: performanceTracker.record.bind(performanceTracker),
+    createGatewayRun,
 });
 
 /** 人工协助：仅提醒，高风险超时不再自动跳过（fail-closed） */
@@ -112,20 +115,33 @@ export class CEOAgentRunner {
         /** @type {Record<string, {status: string, qa?: string, reason?: string}>} */
         this._phaseResults = {};
         /**
-         * 门禁 generation：进入临界区后每次写状态前校验。
+         * 门禁 generation + gateId 所有权（抽出为 GateController）。
          * stop/reset/_beginRunAbortScope 时 bump，使活动中的 escalate/HITL 写状态作废。
          */
-        this._gateGeneration = 0;
-        /** 当前 Runner/轮次的跨实例唯一所有权令牌，避免 replacement 后 generation ABA。 */
-        this._runGateId = null;
+        this._gates = createGateController({ createId: uuidv4 });
+    }
+
+    get _gateGeneration() {
+        return this._gates.generation;
+    }
+
+    set _gateGeneration(value) {
+        this._gates.generation = value;
+    }
+
+    get _runGateId() {
+        return this._gates.runGateId;
+    }
+
+    set _runGateId(value) {
+        this._gates.runGateId = value;
     }
 
     /**
      * 开启本轮执行的 Abort 作用域（会取消上一轮未结束的 LLM 请求）
      */
     _beginRunAbortScope() {
-        this._gateGeneration = (this._gateGeneration || 0) + 1;
-        this._runGateId = uuidv4();
+        this._gates.bump({ rotateRunId: true });
         if (this._runAbortController) {
             try {
                 this._runAbortController.abort();
@@ -136,26 +152,11 @@ export class CEOAgentRunner {
     }
 
     _captureGateToken() {
-        if (!this._runGateId) {
-            this._runGateId = uuidv4();
-        }
-        return {
-            generation: this._gateGeneration,
-            // 每个门禁都唯一；run scope 前缀既防跨 Runner ABA，也防同一轮旧门禁误清后续门禁。
-            gateId: `${this._runGateId}:${uuidv4()}`,
-        };
+        return this._gates.captureToken();
     }
 
     _rollbackOwnedGate(gateId, gateType) {
-        if (!gateId) return;
-        this.dispatch({
-            type: 'ROLLBACK_GATE',
-            payload: {
-                gateId,
-                gateType,
-                status: 'blocked',
-            },
-        });
+        this._gates.rollbackOwned(this.dispatch, gateId, gateType);
     }
 
     /**
@@ -163,40 +164,29 @@ export class CEOAgentRunner {
      * 这里的后备路径仍只按精确 gateId 清理，绝不按 waiting 类型误删新门禁。
      */
     _rollbackOwnedGateCompat(gateId, gateType) {
-        if (!gateId) return;
-        const before = this.getState();
-        const checkpointOwned = before.workflowCheckpoint?.gateId === gateId
-            && (!gateType || before.workflowCheckpoint?.type === gateType);
-        const decisionOwned = before.pendingDecision?.gateId === gateId;
-
-        this._rollbackOwnedGate(gateId, gateType);
-        let after = this.getState();
-
-        if (checkpointOwned && after.workflowCheckpoint?.gateId === gateId) {
-            this._clearWorkflowCheckpoint();
-            after = this.getState();
-        }
-        if (decisionOwned && after.pendingDecision?.gateId === gateId) {
-            this.dispatch({ type: 'RESOLVE_DECISION', payload: { gateId } });
-            after = this.getState();
-        }
-        if (checkpointOwned && after.systemStatus === gateType) {
-            this.dispatch({ type: 'SET_STATUS', payload: 'blocked' });
-        }
+        this._gates.rollbackOwnedCompat({
+            dispatch: this.dispatch,
+            getState: this.getState,
+            clearCheckpoint: () => this._clearWorkflowCheckpoint(),
+        }, gateId, gateType);
     }
 
     /** 门禁 generation 是否仍有效（且未 abort） */
     _isGateGenerationAlive(gen) {
-        return !this._aborted
-            && gen === this._gateGeneration
-            && !this._getRunSignal()?.aborted;
+        return this._gates.isAlive(gen, {
+            aborted: this._aborted,
+            signal: this._getRunSignal(),
+        });
     }
 
     /**
      * 若 generation 已作废则返回 true（调用方应立即中止写状态）
      */
     _gateInvalidated(gen) {
-        return !this._isGateGenerationAlive(gen);
+        return this._gates.invalidated(gen, {
+            aborted: this._aborted,
+            signal: this._getRunSignal(),
+        });
     }
 
     _getRunSignal() {
@@ -372,8 +362,11 @@ ${modelList}
     }
 
     /**
-     * 使用 LLM 判断子任务是否需要人工介入
-     * 比硬编码关键词更智能，能理解语义上下文
+     * 判断子任务是否需要人工介入（双通道 + fail-closed）
+     * 1) 关键词/角色命中 → 立即拦截（中英混合模式，不依赖 LLM）
+     * 2) 未命中且有 CEO 模型 → LLM 只答 YES/NO；不可解析或调用失败 → 要求介入
+     * 3) 无模型 → 对「操作/注册/提交」等保守词要求介入
+     * 英文绕写、未见过的说法仍可能漏拦。
      * @param {object} agent - 当前 Agent
      * @param {string} subtask - 子任务描述
      * @returns {Promise<boolean>}
@@ -512,6 +505,11 @@ ${modelList}
             if (this._aborted) return;
 
             logger.info('CEO', `AI 目标拆解完成：类型=${decomposition.type}，阶段=${decomposition.totalPhases}，角色=${decomposition.roles.map(r => r.name).join(',')}`);
+            void Promise.resolve(this.dependencies.createGatewayRun?.({
+                objective,
+                status: 'running',
+                sessionId,
+            })).catch(() => {});
             this.dispatch({
                 type: 'SET_DECOMPOSITION',
                 payload: decomposition,
@@ -3745,7 +3743,7 @@ ${modelList}
         this._paused = false;
 
         // 作废排队中 + 活动中的用户门禁（generation 令牌）
-        this._gateGeneration = (this._gateGeneration || 0) + 1;
+        this._gates.bump({ rotateRunId: false });
         try {
             this._userGate?.invalidate?.();
         } catch (_) { /* ignore */ }
