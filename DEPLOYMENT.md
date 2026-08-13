@@ -39,7 +39,7 @@ npm run preview
 
 目标是先解除「浏览器持有 raw key」；关页即停仍在。详见 [gateway/README.md](./gateway/README.md)。
 
-已具备：环境变量密钥、`POST /api/llm/chat`、`POST/GET /api/runs` 记录落盘、上游白名单（服务端 SSRF 防护）、RPM 限流、脱敏审计行。
+已具备：环境变量密钥、`POST /api/llm/chat`、`POST/GET/PATCH /api/runs` 记录与检查点对账、上游白名单（服务端 SSRF 防护）、RPM 限流、脱敏审计行。
 
 尚未具备：关页后继续跑 Agent、多租户、Docker、生产 SLA。
 

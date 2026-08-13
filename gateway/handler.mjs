@@ -11,7 +11,7 @@ function corsHeaders(origin) {
     return {
         'Access-Control-Allow-Origin': origin || '*',
         'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
     };
 }
 
@@ -104,6 +104,28 @@ export function createGatewayHandler(options = {}) {
             } catch (err) {
                 if (err?.code === 'SECRET_REJECTED') {
                     return json(400, { error: 'provider_key_not_accepted' });
+                }
+                throw err;
+            }
+        }
+        if (method === 'PATCH' && runId) {
+            const payload = safeParseJson(rawBody);
+            if (!payload) return json(400, { error: 'invalid_json' });
+            if (payload.apiKey || payload.api_key || payload.secret || payload.accessToken) {
+                return json(400, { error: 'provider_key_not_accepted' });
+            }
+            try {
+                const record = runStore.update(runId, payload);
+                return json(200, { record });
+            } catch (err) {
+                if (err?.code === 'SECRET_REJECTED') {
+                    return json(400, { error: 'provider_key_not_accepted' });
+                }
+                if (err?.code === 'NOT_FOUND') {
+                    return json(404, { error: 'run_not_found' });
+                }
+                if (err?.code === 'INVALID_TRANSITION') {
+                    return json(409, { error: 'invalid_status_transition', reason: err.message });
                 }
                 throw err;
             }

@@ -32,6 +32,11 @@ curl -s -H "Authorization: Bearer $GATEWAY_TOKEN" \
 
 curl -s -H "Authorization: Bearer $GATEWAY_TOKEN" \
   http://127.0.0.1:8787/api/runs/<id>
+
+curl -s -X PATCH -H "Authorization: Bearer $GATEWAY_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"waiting_for_config","checkpointType":"waiting_for_config"}' \
+  http://127.0.0.1:8787/api/runs/<id>
 ```
 
 ## 前端
@@ -51,6 +56,6 @@ curl -s -H "Authorization: Bearer $GATEWAY_TOKEN" \
 | 拒绝 127.0.0.1 / RFC1918 | 多租户 / 账单 |
 | 拒绝客户端上传 raw key | TLS 终结（请放在本机或反向代理后） |
 | 内存 RPM 限流 | 生产 SLA |
-| 运行记录落盘（create/get） | 标准 MCP |
+| 运行记录落盘（create/get/patch） | 关页后 Agent 继续执行 / 标准 MCP |
 
 Gateway **代发**请求，因此必须防服务端 SSRF：未知主机与私网地址会 403。

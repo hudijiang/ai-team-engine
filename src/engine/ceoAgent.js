@@ -55,7 +55,7 @@ import {
     redactSensitive,
 } from '../utils/sensitiveData.js';
 import { DEFAULT_TOOL_POLICY } from './capabilityRuntime.js';
-import { createGatewayRun } from './gatewayRuns.js';
+import { createGatewayRun, patchGatewayRun } from './gatewayRuns.js';
 
 const DEFAULT_DEPENDENCIES = Object.freeze({
     decomposeWithLLM,
@@ -71,6 +71,7 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
     saveMemory,
     recordPerformance: performanceTracker.record.bind(performanceTracker),
     createGatewayRun,
+    patchGatewayRun,
 });
 
 /** 人工协助：仅提醒，高风险超时不再自动跳过（fail-closed） */
@@ -87,9 +88,16 @@ export class CEOAgentRunner {
      * @param {Function} getState - 获取当前状态
      */
     constructor(dispatch, getState, dependencies = {}) {
-        this.dispatch = dispatch;
+        this._rawDispatch = dispatch;
+        this.dispatch = (action) => {
+            this._rawDispatch(action);
+            if (action?.type === 'SET_STATUS' && typeof action.payload === 'string') {
+                this._syncGatewayRun({ status: action.payload });
+            }
+        };
         this.getState = getState;
         this.dependencies = { ...DEFAULT_DEPENDENCIES, ...dependencies };
+        this._gatewayRunId = null;
         this.timers = [];
         this.isRunning = false;
         this._aborted = false;
@@ -505,11 +513,17 @@ ${modelList}
             if (this._aborted) return;
 
             logger.info('CEO', `AI 目标拆解完成：类型=${decomposition.type}，阶段=${decomposition.totalPhases}，角色=${decomposition.roles.map(r => r.name).join(',')}`);
-            void Promise.resolve(this.dependencies.createGatewayRun?.({
-                objective,
-                status: 'running',
-                sessionId,
-            })).catch(() => {});
+            try {
+                const record = await this.dependencies.createGatewayRun?.({
+                    objective,
+                    status: 'running',
+                    sessionId,
+                });
+                if (record?.id) {
+                    this._gatewayRunId = record.id;
+                    this._rawDispatch({ type: 'SET_GATEWAY_RUN_ID', payload: record.id });
+                }
+            } catch (_) { /* Gateway 不可用时继续本地编排 */ }
             this.dispatch({
                 type: 'SET_DECOMPOSITION',
                 payload: decomposition,
@@ -1289,6 +1303,17 @@ ${modelList}
 
     _setWorkflowCheckpoint(payload) {
         this.dispatch({ type: 'SET_WORKFLOW_CHECKPOINT', payload });
+        this._syncGatewayRun({
+            checkpointType: payload?.type || null,
+            currentPhase: payload?.currentPhase || null,
+            completedPhases: Array.isArray(payload?.completedPhases) ? payload.completedPhases : undefined,
+        });
+    }
+
+    _syncGatewayRun(patch = {}) {
+        const id = this._gatewayRunId || this.getState?.()?.gatewayRunId;
+        if (!id || typeof this.dependencies.patchGatewayRun !== 'function') return;
+        void Promise.resolve(this.dependencies.patchGatewayRun(id, patch)).catch(() => {});
     }
 
     _clearWorkflowCheckpoint() {

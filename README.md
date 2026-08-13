@@ -209,7 +209,7 @@ npm run build     # tsc && vite build
 并行推进，避免「先拆完 3800 行 CEO 再做 Gateway」的大爆炸：
 
 1. **增量拆分**：门禁已抽出 `src/engine/gateController.js`；下一步是阶段运行器
-2. **最小单租户 Gateway**：`npm run gateway` 可代调 chat、托管密钥，并用 `POST/GET /api/runs` 落盘运行记录（见 [gateway/README.md](./gateway/README.md)）。关页后 **Agent 不会继续跑**
+2. **最小单租户 Gateway**：`npm run gateway` 可代调 chat、托管密钥，并用 `POST/GET/PATCH /api/runs` 与本地检查点对账（见 [gateway/README.md](./gateway/README.md)）。关页后 **Agent 不会继续跑**
 3. 主路径 Playwright / 真实供应商烟雾测试
 4. 其后：工具沙箱、可视化编排；多租户放到单租户控制平面稳定之后
 

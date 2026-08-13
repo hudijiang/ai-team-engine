@@ -10,6 +10,7 @@ import { createTokenBucket } from '../gateway/rateLimit.mjs';
 import {
     importFreshFromRoot,
     resetBrowserState,
+    settleAsync,
 } from './helpers/browserEnv.mjs';
 
 test('allowlist denies private hosts and unknown public hosts', () => {
@@ -230,6 +231,175 @@ test('browser createGatewayRun writes through the shipped handler and can be rea
     } finally {
         globalThis.fetch = previousFetch;
     }
+});
+
+test('PATCH updates run status and slim checkpoint; completed cannot return to running', async () => {
+    const handler = createGatewayHandler({
+        token: 'secret-token',
+        audit: () => {},
+        runStore: createRunStore(),
+    });
+    const auth = { authorization: 'Bearer secret-token' };
+    const created = JSON.parse((await handler({
+        method: 'POST',
+        url: '/api/runs',
+        headers: auth,
+        body: JSON.stringify({ objective: 'state machine', status: 'running' }),
+    })).body);
+
+    const patched = await handler({
+        method: 'PATCH',
+        url: `/api/runs/${created.record.id}`,
+        headers: auth,
+        body: JSON.stringify({
+            status: 'waiting_for_human',
+            checkpointType: 'waiting_for_human',
+            currentPhase: '登录',
+            completedPhases: ['准备'],
+        }),
+    });
+    assert.equal(patched.status, 200);
+    const afterPatch = JSON.parse(patched.body).record;
+    assert.equal(afterPatch.status, 'waiting_for_human');
+    assert.equal(afterPatch.checkpointType, 'waiting_for_human');
+    assert.equal(afterPatch.currentPhase, '登录');
+    assert.deepEqual(afterPatch.completedPhases, ['准备']);
+
+    const backToRun = await handler({
+        method: 'PATCH',
+        url: `/api/runs/${created.record.id}`,
+        headers: auth,
+        body: JSON.stringify({ status: 'running' }),
+    });
+    assert.equal(backToRun.status, 200);
+    const completed = await handler({
+        method: 'PATCH',
+        url: `/api/runs/${created.record.id}`,
+        headers: auth,
+        body: JSON.stringify({ status: 'completed' }),
+    });
+    assert.equal(completed.status, 200);
+    const invalid = await handler({
+        method: 'PATCH',
+        url: `/api/runs/${created.record.id}`,
+        headers: auth,
+        body: JSON.stringify({ status: 'running' }),
+    });
+    assert.equal(invalid.status, 409);
+    assert.match(invalid.body, /invalid_status_transition/);
+});
+
+test('start then stop keeps one gateway run id and ends blocked', async () => {
+    resetBrowserState();
+    const { createAgent } = await importFreshFromRoot('src/engine/agentEngine.js');
+    const { CEOAgentRunner } = await importFreshFromRoot('src/engine/ceoAgent.js');
+    const { saveGatewayConfig } = await importFreshFromRoot('src/engine/gatewayConfig.js');
+    const { getGatewayRun } = await importFreshFromRoot('src/engine/gatewayRuns.js');
+
+    saveGatewayConfig({
+        useGateway: true,
+        gatewayUrl: 'http://gateway.local',
+        accessToken: 'secret-token',
+    });
+
+    const handler = createGatewayHandler({
+        token: 'secret-token',
+        audit: () => {},
+        runStore: createRunStore(),
+    });
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+        const parsed = new URL(url, 'http://gateway.local');
+        const result = await handler({
+            method: init.method || 'GET',
+            url: `${parsed.pathname}${parsed.search}`,
+            headers: init.headers || {},
+            body: init.body || '',
+        });
+        return {
+            ok: result.status >= 200 && result.status < 300,
+            status: result.status,
+            json: async () => JSON.parse(result.body || '{}'),
+        };
+    };
+
+    const ceo = createAgent({ name: 'CEO', role: 'ceo', model: 'mock' });
+    const state = {
+        agents: [ceo],
+        messages: [],
+        availableModels: { custom: [{ id: 'mock' }] },
+        defaultModel: 'mock',
+        decomposition: null,
+        workflowCheckpoint: null,
+        pendingDecision: null,
+        systemStatus: 'idle',
+        gatewayRunId: null,
+    };
+    const dispatch = (action) => {
+        if (action.type === 'SET_STATUS') state.systemStatus = action.payload;
+        if (action.type === 'SET_DECOMPOSITION') state.decomposition = action.payload;
+        if (action.type === 'SET_WORKFLOW_CHECKPOINT') state.workflowCheckpoint = action.payload;
+        if (action.type === 'CLEAR_WORKFLOW_CHECKPOINT') state.workflowCheckpoint = null;
+        if (action.type === 'SET_GATEWAY_RUN_ID') state.gatewayRunId = action.payload;
+        if (action.type === 'ADD_AGENT') state.agents = [...state.agents, action.payload];
+        if (action.type === 'UPDATE_AGENT') {
+            const { id, ...u } = action.payload;
+            state.agents = state.agents.map(a => (a.id === id ? { ...a, ...u } : a));
+        }
+        if (action.type === 'ADD_MESSAGE') state.messages.push(action.payload);
+    };
+
+    try {
+        const runner = new CEOAgentRunner(dispatch, () => state, {
+            decomposeWithLLM: async () => ({
+                objective: '对账目标',
+                type: 'test',
+                totalPhases: 1,
+                estimatedDuration: 1,
+                roles: [{ name: '工程师', role: 'dev', color: '#111' }],
+                tasks: [{ phase: '开发', assignee: '工程师', subtasks: ['x'], dependencies: [] }],
+            }),
+        });
+        runner._delay = async () => {};
+        runner._autoRecommendModel = async () => 'mock';
+        runner._emitCEOMessage = () => {};
+
+        await runner.start('对账目标');
+        const runId = runner._gatewayRunId || state.gatewayRunId;
+        assert.ok(runId, 'expected a gateway run id after start');
+        const mid = await getGatewayRun(runId);
+        assert.equal(mid.id, runId);
+        assert.equal(mid.objective, '对账目标');
+        assert.ok(['running', 'waiting_for_config'].includes(mid.status));
+
+        runner.stop();
+        await settleAsync(4);
+        const done = await getGatewayRun(runId);
+        assert.equal(done.id, runId);
+        assert.equal(done.status, 'blocked');
+        assert.equal(done.objective, '对账目标');
+    } finally {
+        globalThis.fetch = previousFetch;
+    }
+});
+
+test('alignStateWithGatewayRun notes a gateway record when local checkpoint is gone', async () => {
+    const { alignStateWithGatewayRun } = await importFreshFromRoot('src/store/storeRecovery.js');
+    const aligned = alignStateWithGatewayRun({
+        systemStatus: 'blocked',
+        workflowCheckpoint: null,
+        messages: [],
+    }, {
+        id: 'run-align-1',
+        objective: '对账',
+        status: 'waiting_for_human',
+        checkpointType: 'waiting_for_human',
+        currentPhase: '登录',
+    });
+    assert.equal(aligned.gatewayRunId, 'run-align-1');
+    assert.equal(aligned.messages.at(-1).source, 'system-recovery');
+    assert.match(aligned.messages.at(-1).dialogue.join(''), /run-align-1/);
+    assert.match(aligned.messages.at(-1).dialogue.join(''), /waiting_for_human/);
 });
 
 test('token bucket rate-limits after rpm', () => {

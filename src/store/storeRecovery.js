@@ -75,6 +75,57 @@ export function createWorkflowInterruptedMessage(previousStatus, options = {}) {
     };
 }
 
+/**
+ * 用 Gateway 运行记录对齐本地状态。
+ * 不伪造可执行检查点：本地仍是执行真相；Gateway 只提供对账与提示。
+ */
+export function alignStateWithGatewayRun(state, gatewayRecord) {
+    if (!state || !gatewayRecord?.id) return state;
+
+    const next = {
+        ...state,
+        messages: [...(state.messages || [])],
+        gatewayRunId: gatewayRecord.id,
+    };
+
+    const localRecoverable = hasRecoverableCheckpoint(next)
+        || hasRecoverableRunningCheckpoint(next);
+    const gatewayActive = !['completed', 'created'].includes(gatewayRecord.status);
+    const localLost = !localRecoverable
+        && ['idle', 'blocked', 'completed'].includes(next.systemStatus || 'idle');
+
+    if (localLost && gatewayActive) {
+        const alreadyNoted = next.messages.some(msg => (
+            msg?.source === 'system-recovery'
+            && Array.isArray(msg.dialogue)
+            && msg.dialogue.some(line => String(line).includes(gatewayRecord.id))
+        ));
+        if (!alreadyNoted) {
+            next.messages.push({
+                role: '系统',
+                state: 'blocked',
+                current_task: 'Gateway 记录可对账',
+                progress: 1,
+                collaborators: ['CEO'],
+                dialogue: [
+                    `Gateway 仍保存运行记录 ${gatewayRecord.id}。`,
+                    `目标：「${String(gatewayRecord.objective || '').slice(0, 80)}」，状态：${gatewayRecord.status}。`,
+                    gatewayRecord.checkpointType
+                        ? `最后检查点类型：${gatewayRecord.checkpointType}${gatewayRecord.currentPhase ? `（${gatewayRecord.currentPhase}）` : ''}。`
+                        : '本地检查点缺失，无法自动续跑 Agent。',
+                    '关页不会继续执行；可从本地检查点恢复，或重新发布目标。',
+                ],
+                next_step: ['从检查点继续（若本地仍有）', '或重新发布目标'],
+                agentId: 'system',
+                timestamp: new Date().toISOString(),
+                source: 'system-recovery',
+            });
+        }
+    }
+
+    return next;
+}
+
 export function sanitizeLoadedState(state) {
     if (!state) return null;
 
@@ -155,5 +206,6 @@ export default {
     hasRecoverableCheckpoint,
     hasRecoverableRunningCheckpoint,
     createWorkflowInterruptedMessage,
+    alignStateWithGatewayRun,
     sanitizeLoadedState,
 };

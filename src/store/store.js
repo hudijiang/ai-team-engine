@@ -8,7 +8,9 @@ import { createAgent, AGENT_STATES } from '../engine/agentEngine.js';
 import logger from '../utils/logger.js';
 import { loadIndexedValue, saveIndexedValue } from '../utils/indexedDBStorage.js';
 import { redactSensitiveDeep } from '../utils/sensitiveData.js';
-import { sanitizeLoadedState } from './storeRecovery.js';
+import { alignStateWithGatewayRun, sanitizeLoadedState } from './storeRecovery.js';
+import { ensureGatewayConfigHydrated, isGatewayEnabled } from '../engine/gatewayConfig.js';
+import { getGatewayRun, listGatewayRuns } from '../engine/gatewayRuns.js';
 
 const STORAGE_KEY = 'agent-auto-state';
 const FULL_STATE_STORAGE_KEY = 'state:full';
@@ -283,6 +285,10 @@ function agentReducer(state, action) {
             return { ...state, promptLogs: [] };
         }
 
+        case 'SET_GATEWAY_RUN_ID': {
+            return { ...state, gatewayRunId: action.payload || null };
+        }
+
         default:
             return state;
     }
@@ -308,6 +314,7 @@ function pickPersistable(state) {
         selectedAgentId: state.selectedAgentId,
         availableModels: state.availableModels,
         promptLogs: (state.promptLogs || []).slice(-50),
+        gatewayRunId: state.gatewayRunId || null,
     };
 }
 
@@ -325,6 +332,7 @@ function pickBootstrapPersistable(state) {
         decomposition: state.decomposition,
         selectedAgentId: state.selectedAgentId,
         availableModels: state.availableModels,
+        gatewayRunId: state.gatewayRunId || null,
     };
 }
 
@@ -382,6 +390,7 @@ function getInitialState() {
         availableModels: {},
         promptLogs: [],
         hasHydrated: false,
+        gatewayRunId: null,
     };
 }
 
@@ -428,7 +437,20 @@ export const useStore = create((set, get) => ({
             return;
         }
 
-        const hydrated = { ...next, hasHydrated: true };
+        let aligned = next;
+        try {
+            const gw = await ensureGatewayConfigHydrated();
+            if (isGatewayEnabled(gw)) {
+                const record = next.gatewayRunId
+                    ? await getGatewayRun(next.gatewayRunId)
+                    : (await listGatewayRuns()).sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
+                if (record) {
+                    aligned = alignStateWithGatewayRun(next, record);
+                }
+            }
+        } catch (_) { /* Gateway 不可达时保持本地状态 */ }
+
+        const hydrated = { ...aligned, hasHydrated: true };
         saveState(hydrated);
         set(hydrated);
     },

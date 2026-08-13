@@ -209,7 +209,7 @@ More: [PRIVACY.md](./PRIVACY.md) · [DEPLOYMENT.md](./DEPLOYMENT.md)
 Work in parallel; do not wait to finish a 3.8k-line CEO split before any Gateway:
 
 1. **Incremental split**: gates live in `src/engine/gateController.js`; next is the phase runner
-2. **Minimal single-tenant Gateway**: `npm run gateway` proxies chat, hosts keys, and persists run *records* via `POST/GET /api/runs` (see [gateway/README.md](./gateway/README.md)). Closing the tab still stops live agents
+2. **Minimal single-tenant Gateway**: `npm run gateway` proxies chat, hosts keys, and syncs run records via `POST/GET/PATCH /api/runs` (see [gateway/README.md](./gateway/README.md)). Closing the tab still stops live agents
 3. Playwright on the main path / optional real-provider smoke tests
 4. Later: tool sandboxes and a visual editor; multi-tenant only after the single-tenant plane is stable
 
