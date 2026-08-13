@@ -31,6 +31,11 @@ import {
     shouldMarkPhaseComplete,
 } from './executionControl.js';
 import { createGateController } from './gateController.js';
+import {
+    executeAgentPhase,
+    runRemainingSubtasks,
+    finalizeAgentPhase,
+} from './phaseRunner.js';
 import { recordTimelineEvent, clearTimelineEvents } from './timelineRecorder.js';
 import {
     buildRunningExecutionCheckpoint,
@@ -56,6 +61,7 @@ import {
 } from '../utils/sensitiveData.js';
 import { DEFAULT_TOOL_POLICY } from './capabilityRuntime.js';
 import { createGatewayRun, patchGatewayRun } from './gatewayRuns.js';
+import { ensureGatewayConfigHydrated, isGatewayEnabled } from './gatewayConfig.js';
 
 const DEFAULT_DEPENDENCIES = Object.freeze({
     decomposeWithLLM,
@@ -72,6 +78,8 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
     recordPerformance: performanceTracker.record.bind(performanceTracker),
     createGatewayRun,
     patchGatewayRun,
+    ensureGatewayConfigHydrated,
+    isGatewayEnabled,
 });
 
 /** 人工协助：仅提醒，高风险超时不再自动跳过（fail-closed） */
@@ -88,16 +96,12 @@ export class CEOAgentRunner {
      * @param {Function} getState - 获取当前状态
      */
     constructor(dispatch, getState, dependencies = {}) {
-        this._rawDispatch = dispatch;
-        this.dispatch = (action) => {
-            this._rawDispatch(action);
-            if (action?.type === 'SET_STATUS' && typeof action.payload === 'string') {
-                this._syncGatewayRun({ status: action.payload });
-            }
-        };
-        this.getState = getState;
         this.dependencies = { ...DEFAULT_DEPENDENCIES, ...dependencies };
         this._gatewayRunId = null;
+        this._gatewayRevision = 0;
+        this._lastPhaseError = null;
+        this._gatewaySyncTail = Promise.resolve();
+        this.bindStore(dispatch, getState);
         this.timers = [];
         this.isRunning = false;
         this._aborted = false;
@@ -127,6 +131,24 @@ export class CEOAgentRunner {
          * stop/reset/_beginRunAbortScope 时 bump，使活动中的 escalate/HITL 写状态作废。
          */
         this._gates = createGateController({ createId: uuidv4 });
+    }
+
+    /**
+     * 只替换 store 句柄，不得覆盖包装后的 dispatch（否则 Gateway 状态同步会丢失）。
+     */
+    bindStore(dispatch, getState) {
+        this._rawDispatch = dispatch;
+        this.getState = getState;
+        this.dispatch = (action) => {
+            this._rawDispatch(action);
+            if (action?.type === 'SET_STATUS' && typeof action.payload === 'string') {
+                this._syncGatewayRun({
+                    status: action.payload,
+                    lastError: action.payload === 'blocked' ? (this._lastPhaseError || null) : null,
+                });
+            }
+        };
+        return this;
     }
 
     get _gateGeneration() {
@@ -521,6 +543,7 @@ ${modelList}
                 });
                 if (record?.id) {
                     this._gatewayRunId = record.id;
+                    this._gatewayRevision = Number(record.revision || 1);
                     this._rawDispatch({ type: 'SET_GATEWAY_RUN_ID', payload: record.id });
                 }
             } catch (_) { /* Gateway 不可用时继续本地编排 */ }
@@ -731,31 +754,44 @@ ${modelList}
             let latestTeamAgents = this._refreshTeamAgents(teamAgents);
             const state = this.getState();
 
-            // ✅ 前置检查：验证所有 Agent 的 API Key 是否已配置
-            const configs = await this.dependencies.ensureProviderConfigsHydrated();
+            const gatewayConfig = await this.dependencies.ensureGatewayConfigHydrated?.();
+            const gatewayOn = this.dependencies.isGatewayEnabled?.(gatewayConfig);
             if (this._aborted || this._getRunSignal()?.aborted) return;
 
-            const missingConfigs = [];
-            for (const agent of latestTeamAgents) {
-                if (!agent.model) continue;
-                const providerId = this.dependencies.resolveProviderForModel(agent.model, state.availableModels);
-                    const config = configs[providerId] ?? configs.custom ?? {};
-                if (!config.apiUrl || !config.apiKey) {
-                    missingConfigs.push({ name: agent.name, model: agent.model, provider: providerId });
+            if (gatewayOn) {
+                const missingModels = latestTeamAgents.filter(agent => !agent.model);
+                if (missingModels.length > 0) {
+                    this._emitCEOMessage(ceoAgent, [
+                        '【CEO】⚠️ Gateway 模式下只需为成员填写模型 ID，无需在浏览器保存供应商 Key。',
+                        ...missingModels.map(agent => `  ❌ ${agent.name} 未指定模型`),
+                    ], ['填写模型 ID', '重新启动执行']);
+                    this._pendingExecution = { ceoAgent, teamAgents: latestTeamAgents, decomposition };
+                    return;
                 }
-            }
+            } else {
+                const configs = await this.dependencies.ensureProviderConfigsHydrated();
+                if (this._aborted || this._getRunSignal()?.aborted) return;
+                const missingConfigs = [];
+                for (const agent of latestTeamAgents) {
+                    if (!agent.model) continue;
+                    const providerId = this.dependencies.resolveProviderForModel(agent.model, state.availableModels);
+                    const config = configs[providerId] ?? configs.custom ?? {};
+                    if (!config.apiUrl || !config.apiKey) {
+                        missingConfigs.push({ name: agent.name, model: agent.model, provider: providerId });
+                    }
+                }
 
-            if (missingConfigs.length > 0) {
-                const errorLines = missingConfigs.map(m => `  ❌ ${m.name}（模型: ${m.model}）→ Provider「${m.provider}」未配置 API Key/URL`);
-                this._emitCEOMessage(ceoAgent, [
-                    `【CEO】⚠️ 无法启动执行！以下成员的 AI 模型未完成配置：`,
-                    ...errorLines,
-                    `请先在右上角「⚙️ 设置」中配置对应 Provider 的 API Key 和 URL，然后重新点击「开始执行」。`,
-                ], ['配置 API Key', '重新启动执行']);
-                logger.error('CEO', `API Key 前置检查失败：${missingConfigs.map(m => `${m.name}/${m.provider}`).join(', ')}`);
-                // 保留 _pendingExecution 以便用户配置后重试
-                this._pendingExecution = { ceoAgent, teamAgents: latestTeamAgents, decomposition };
-                return;
+                if (missingConfigs.length > 0) {
+                    const errorLines = missingConfigs.map(m => `  ❌ ${m.name}（模型: ${m.model}）→ Provider「${m.provider}」未配置 API Key/URL`);
+                    this._emitCEOMessage(ceoAgent, [
+                        `【CEO】⚠️ 无法启动执行！以下成员的 AI 模型未完成配置：`,
+                        ...errorLines,
+                        `请先在右上角「⚙️ 设置」中配置对应 Provider 的 API Key 和 URL，然后重新点击「开始执行」。`,
+                    ], ['配置 API Key', '重新启动执行']);
+                    logger.error('CEO', `API Key 前置检查失败：${missingConfigs.map(m => `${m.name}/${m.provider}`).join(', ')}`);
+                    this._pendingExecution = { ceoAgent, teamAgents: latestTeamAgents, decomposition };
+                    return;
+                }
             }
 
             this.dispatch({
@@ -1312,8 +1348,25 @@ ${modelList}
 
     _syncGatewayRun(patch = {}) {
         const id = this._gatewayRunId || this.getState?.()?.gatewayRunId;
-        if (!id || typeof this.dependencies.patchGatewayRun !== 'function') return;
-        void Promise.resolve(this.dependencies.patchGatewayRun(id, patch)).catch(() => {});
+        if (!id || typeof this.dependencies.patchGatewayRun !== 'function') {
+            return Promise.resolve(null);
+        }
+        this._gatewaySyncTail = Promise.resolve(this._gatewaySyncTail).then(async () => {
+            // revision 必须在队列真正执行时读取；入队时捕获会让连续 PATCH
+            // 都携带同一个旧 revision，第二条稳定收到 409 并丢失。
+            const expectedRevision = this._gatewayRevision || undefined;
+            const record = await this.dependencies.patchGatewayRun(id, {
+                ...patch,
+                revision: expectedRevision,
+            });
+            if (record?.revision) this._gatewayRevision = record.revision;
+            return record;
+        }).catch(() => null);
+        return this._gatewaySyncTail;
+    }
+
+    flushGatewaySync() {
+        return Promise.resolve(this._gatewaySyncTail);
     }
 
     _clearWorkflowCheckpoint() {
@@ -1415,473 +1468,17 @@ ${modelList}
      * @returns {Promise<boolean>} 是否成功完成（含 QA）
      */
     async _executeAgentPhase(ceoAgent, agent, task, completedPhases, teamAgents, options = {}) {
-        const agentId = agent.id;
-        const phaseStartedAt = options.phaseStartedAt || new Date().toISOString();
-        let startIndex = Math.max(0, options.startIndex || 0);
-        const skipPlanning = options.skipPlanning || startIndex > 0;
-
-        try {
-            if (this._aborted) return false;
-
-            // 幂等：按 outputs 对齐 startIndex
-            const latestForInfer = this._getLatestAgent(agentId);
-            startIndex = Math.max(startIndex, inferNextSubtaskIndex(latestForInfer, task));
-
-            // 标记阶段进入 inFlight
-            this._persistRunningCheckpoint(
-                ceoAgent,
-                teamAgents,
-                this.getState().decomposition || { tasks: [task] },
-                completedPhases,
-                {
-                    upsertInFlight: {
-                        phase: task.phase,
-                        agentId,
-                        agentName: agent.name,
-                        nextSubtaskIndex: startIndex,
-                        phaseStartedAt,
-                        totalSubtasks: task.subtasks.length,
-                        currentSubtask: task.subtasks[startIndex] || '',
-                    },
-                }
-            );
-
-            // 检查前置等待（UI 提示；依赖已在调度层保证）
-            if (!skipPlanning && (task.dependencies || []).length > 0) {
-                this.dispatch({
-                    type: 'UPDATE_AGENT',
-                    payload: {
-                        id: agentId,
-                        state: AGENT_STATES.WAITING,
-                        currentTask: `等待依赖：${task.dependencies.join(', ')}`,
-                    },
-                });
-                this._emitAgentMessage(agent,
-                    DIALOGUE_TEMPLATES.waiting(agent.name, task.dependencies.join(', ')),
-                    [`等待 ${task.dependencies.join(', ')} 完成`]
-                );
-                await this._delay(1000);
-                if (this._aborted) return false;
-            }
-
-            // 规划阶段（续跑跳过）
-            if (!skipPlanning) {
-                this.dispatch({
-                    type: 'UPDATE_AGENT',
-                    payload: {
-                        id: agentId,
-                        state: AGENT_STATES.PLANNING,
-                        currentTask: `规划：${task.phase}`,
-                        progress: 0.1,
-                    },
-                });
-                this._emitAgentMessage(agent,
-                    DIALOGUE_TEMPLATES.planning(agent.name, task.subtasks),
-                    ['开始执行各子任务']
-                );
-                await this._delay(1500);
-                if (this._aborted) return false;
-            }
-
-            const success = await this._runRemainingSubtasks(
-                ceoAgent, agent, task, completedPhases, teamAgents, startIndex, phaseStartedAt
-            );
-            if (!success || this._aborted) return false;
-
-            const finalized = await this._finalizeAgentPhase(
-                ceoAgent, agent, task, completedPhases, teamAgents, phaseStartedAt
-            );
-            if (!finalized || this._aborted) {
-                this._persistRunningCheckpoint(
-                    ceoAgent,
-                    teamAgents,
-                    this.getState().decomposition,
-                    completedPhases,
-                    { removeInFlightPhase: task.phase }
-                );
-                return false;
-            }
-
-            // 阶段完成：移出 inFlight
-            this._persistRunningCheckpoint(
-                ceoAgent,
-                teamAgents,
-                this.getState().decomposition,
-                completedPhases,
-                { removeInFlightPhase: task.phase }
-            );
-            return true;
-        } catch (err) {
-            logger.error('CEO', `执行阶段「${task.phase}」失败: ${err.message}`);
-            this.dispatch({
-                type: 'UPDATE_AGENT',
-                payload: {
-                    id: agentId,
-                    state: AGENT_STATES.BLOCKED,
-                    currentTask: `阶段失败：${task.phase}`,
-                },
-            });
-            return false;
-        }
+        return executeAgentPhase(this, ceoAgent, agent, task, completedPhases, teamAgents, options);
     }
 
     async _runRemainingSubtasks(ceoAgent, agent, task, completedPhases, teamAgents, startIndex = 0, phaseStartedAt = new Date().toISOString()) {
-        const agentId = agent.id;
-        const subtasks = task.subtasks;
-        const decomposition = this.getState().decomposition;
-
-        for (let i = startIndex; i < subtasks.length; i++) {
-            if (this._aborted) return false;
-
-            const subtask = subtasks[i];
-            const subtaskProgress = (i + 1) / Math.max(subtasks.length, 1);
-
-            // 幂等：已有产出则跳过（避免刷新后重复烧 token）
-            const latestAgent = this._getLatestAgent(agentId);
-            if (isSubtaskOutputPresent(latestAgent, task.phase, subtask)) {
-                this._emitAgentMessage(agent, [
-                    `【${agent.name}】⏭ 子任务已有产出，跳过：${subtask}`,
-                ], [], 'checkpoint-skip');
-                this._persistRunningCheckpoint(ceoAgent, teamAgents, decomposition, completedPhases, {
-                    upsertInFlight: {
-                        phase: task.phase,
-                        agentId,
-                        agentName: agent.name,
-                        nextSubtaskIndex: i + 1,
-                        phaseStartedAt,
-                        totalSubtasks: subtasks.length,
-                        currentSubtask: subtask,
-                    },
-                });
-                continue;
-            }
-
-            this.dispatch({
-                type: 'UPDATE_AGENT',
-                payload: {
-                    id: agentId,
-                    state: AGENT_STATES.EXECUTING,
-                    currentTask: subtask,
-                    currentSubtaskIndex: i,
-                    progress: subtaskProgress * 0.8,
-                },
-            });
-
-            // 开始执行前写入进度（刷新后可从当前子任务续）
-            this._persistRunningCheckpoint(ceoAgent, teamAgents, decomposition, completedPhases, {
-                upsertInFlight: {
-                    phase: task.phase,
-                    agentId,
-                    agentName: agent.name,
-                    nextSubtaskIndex: i,
-                    phaseStartedAt,
-                    totalSubtasks: subtasks.length,
-                    currentSubtask: subtask,
-                },
-            });
-
-            // ★ HITL 前置门禁：敏感操作在执行前拦截，并串行化全局人工闸门
-            let humanAssistContext = '';
-            const needsHumanIntervention = await this._checkHumanInterventionNeeded(agent, subtask);
-            if (this._aborted) return false;
-
-            if (needsHumanIntervention) {
-                recordTimelineEvent('decision', {
-                    agentName: agent.name,
-                    detail: `请求人工协助：${subtask}`,
-                });
-                let humanResult;
-                try {
-                    const gateEpoch = this._userGate.epoch();
-                    humanResult = await this._userGate.runExclusive(
-                        () => this._requestHumanIntervention(agent, subtask, {
-                            ceoAgentId: ceoAgent.id,
-                            teamAgentIds: teamAgents.map(teamAgent => teamAgent.id),
-                            decomposition: this.getState().decomposition || null,
-                            completedPhases: [...completedPhases],
-                            currentPhase: task.phase,
-                            currentAgentId: agent.id,
-                            currentSubtaskIndex: i,
-                            currentSubtask: subtask,
-                            phaseStartedAt,
-                            inFlight: [{
-                                phase: task.phase,
-                                agentId,
-                                agentName: agent.name,
-                                nextSubtaskIndex: i,
-                                phaseStartedAt,
-                                totalSubtasks: subtasks.length,
-                                currentSubtask: subtask,
-                            }],
-                        }),
-                        {
-                            expectedEpoch: gateEpoch,
-                            isAlive: () => !this._aborted,
-                        }
-                    );
-                } catch (gateErr) {
-                    if (gateErr?.code === ABORT_REASON.GATE_CANCELLED || this._aborted) {
-                        return false;
-                    }
-                    throw gateErr;
-                }
-
-                if (
-                    humanResult === ABORT_REASON.TIMEOUT_ABORT
-                    || humanResult === ABORT_REASON.STOPPED
-                    || humanResult === ABORT_REASON.RESET
-                    || humanResult === ABORT_REASON.GATE_CANCELLED
-                    || this._aborted
-                ) {
-                    return false;
-                }
-
-                if (humanResult === 'FORCE_CONTINUE' || humanResult === 'SKIPPED_BY_USER' || humanResult === 'TIMEOUT_SKIP') {
-                    // 显式跳过：不计入成功，阶段失败
-                    this._emitAgentMessage(agent, [
-                        `【${agent.name}】子任务被显式跳过：${subtask}（不计为成功）`,
-                    ], [], 'skipped');
-                    this.dispatch({
-                        type: 'UPDATE_AGENT_OUTPUTS',
-                        payload: {
-                            id: agentId,
-                            output: {
-                                phase: task.phase,
-                                subtask,
-                                content: `（已跳过：${humanResult}）`,
-                                source: 'skipped',
-                                status: STEP_STATUS.SKIPPED,
-                            },
-                        },
-                    });
-                    return false;
-                }
-                if (humanResult) {
-                    humanAssistContext = buildSafeHumanAssistContext(humanResult, subtask);
-                }
-            }
-
-            const streamClientId = uuidv4();
-            let liveBuffer = '';
-            const result = await this._executeSubtask(
-                agent,
-                subtask,
-                subtaskProgress,
-                (token) => {
-                    liveBuffer += token;
-                    this.dispatch({
-                        type: 'UPSERT_MESSAGE',
-                        payload: {
-                            ...createStructuredMessage(agent, [liveBuffer], []),
-                            agentId: agent.id,
-                            timestamp: new Date().toISOString(),
-                            source: 'llm-stream',
-                            clientId: streamClientId,
-                        },
-                    });
-                },
-                humanAssistContext
-            );
-
-            if (this._aborted) return false;
-
-            const normalized = normalizeSubtaskResult(result);
-            // 模板/失败产出不得当作成功继续
-            if (!isSuccessStatus(normalized.status) && normalized.status !== STEP_STATUS.SKIPPED) {
-                this._emitAgentMessage(agent, [
-                    `【${agent.name}】❌ 子任务失败：${subtask}`,
-                    normalized.reason || `来源=${normalized.source}，状态=${statusLabel(normalized.status)}`,
-                ], [], 'failed');
-                this.dispatch({
-                    type: 'UPDATE_AGENT_OUTPUTS',
-                    payload: {
-                        id: agentId,
-                        output: {
-                            phase: task.phase,
-                            subtask,
-                            content: normalized.content || normalized.reason || '（失败）',
-                            source: normalized.source,
-                            status: normalized.status,
-                        },
-                    },
-                });
-                return false;
-            }
-
-            // 存储实质产出（仅 success）
-            this.dispatch({
-                type: 'UPDATE_AGENT_OUTPUTS',
-                payload: {
-                    id: agentId,
-                    output: {
-                        phase: task.phase,
-                        subtask,
-                        content: normalized.content,
-                        source: normalized.source,
-                        status: normalized.status,
-                    },
-                },
-            });
-
-            this._emitAgentMessage(agent,
-                normalized.summary,
-                i < subtasks.length - 1
-                    ? [`继续执行：${subtasks[i + 1]}`]
-                    : ['进入审核阶段'],
-                normalized.source,
-                streamClientId,
-                normalized.content
-            );
-
-            // 子任务完成后推进 nextSubtaskIndex
-            this._persistRunningCheckpoint(ceoAgent, teamAgents, decomposition, completedPhases, {
-                upsertInFlight: {
-                    phase: task.phase,
-                    agentId,
-                    agentName: agent.name,
-                    nextSubtaskIndex: i + 1,
-                    phaseStartedAt,
-                    totalSubtasks: subtasks.length,
-                    currentSubtask: subtask,
-                },
-            });
-
-            await this._delay(1500 + Math.random() * 1000);
-            if (this._aborted) return false;
-
-            this._emitAgentMessage(agent,
-                DIALOGUE_TEMPLATES.subtaskComplete(agent.name, subtask),
-                []
-            );
-        }
-
-        return true;
+        return runRemainingSubtasks(this, ceoAgent, agent, task, completedPhases, teamAgents, startIndex, phaseStartedAt);
     }
 
-    /**
-     * 阶段收尾：QA 必须 pass 才算完成
-     * @returns {Promise<boolean>}
-     */
     async _finalizeAgentPhase(ceoAgent, agent, task, completedPhases, teamAgents, phaseStartedAt = new Date().toISOString()) {
-        const agentId = agent.id;
-
-        // 审核阶段
-        this.dispatch({
-            type: 'UPDATE_AGENT',
-            payload: {
-                id: agentId,
-                state: AGENT_STATES.REVIEWING,
-                currentTask: `审核：${task.phase}`,
-                progress: 0.9,
-            },
-        });
-        this._emitAgentMessage(agent,
-            DIALOGUE_TEMPLATES.reviewing(agent.name),
-            ['提交最终成果']
-        );
-        await this._delay(1500);
-
-        const qaReview = await this._runPhaseQualityGate(ceoAgent, agent, task);
-        const phaseContent = qaReview.finalContent || this._buildPhaseOutput(agent, task);
-
-        // QA 未通过：不得标记 COMPLETED，不得解锁下游
-        if (qaReview.result !== 'pass') {
-            this.dispatch({
-                type: 'UPDATE_AGENT',
-                payload: {
-                    id: agentId,
-                    state: AGENT_STATES.BLOCKED,
-                    currentTask: `${task.phase} - QA 未通过`,
-                    progress: 0.9,
-                },
-            });
-            this._emitCEOMessage(ceoAgent, [
-                `【CEO】❌ 「${task.phase}」质量门未通过，阶段不计为完成。`,
-                qaReview.suggestion
-                    ? `原因：${qaReview.suggestion}`
-                    : '请修订产出或重置后重试。',
-            ], ['阶段阻塞']);
-            recordTimelineEvent('qa_review', {
-                agentName: agent.name,
-                detail: `${task.phase} — QA 未通过`,
-            });
-            this._recordPhasePerformance(agent, task, phaseStartedAt, qaReview, phaseContent);
-            this._phaseResults[task.phase] = {
-                status: STEP_STATUS.FAILED,
-                qa: qaReview.result,
-                reason: qaReview.suggestion || 'QA 未通过',
-            };
-            return false;
-        }
-
-        // 标记完成
-        this.dispatch({
-            type: 'UPDATE_AGENT',
-            payload: {
-                id: agentId,
-                state: AGENT_STATES.COMPLETED,
-                currentTask: `${task.phase} - 已完成`,
-                progress: 1.0,
-            },
-        });
-        this._emitAgentMessage(agent,
-            DIALOGUE_TEMPLATES.completed(agent.name, task.phase),
-            []
-        );
-
-        this._recordPhasePerformance(agent, task, phaseStartedAt, qaReview, phaseContent);
-        this._phaseResults[task.phase] = {
-            status: STEP_STATUS.SUCCESS,
-            qa: 'pass',
-        };
-
-        // 持久化阶段经验，供后续会话注入
-        try {
-            const experience = (phaseContent || '').slice(0, 400).replace(/\s+/g, ' ');
-            if (experience) {
-                this.dependencies.saveMemory(agent.name, task.phase, experience);
-            }
-        } catch (e) {
-            logger.warn('Memory', `保存记忆失败: ${e.message}`);
-        }
-
-        this._emitCEOMessage(ceoAgent, [
-            `【CEO】收到 ${agent.name} 报告：「${task.phase}」阶段已完成 ✅`,
-            '质量结论：QA 通过',
-        ], []);
-        recordTimelineEvent('qa_review', {
-            agentName: agent.name,
-            detail: `${task.phase} — QA 通过`,
-        });
-
-        // ★ 阶段完成后，与下游依赖的 Agent 进行多轮协作共识
-        const state = this.getState();
-        const allTasks = state.decomposition?.tasks ?? [];
-        const downstreamTasks = allTasks.filter(t =>
-            t.dependencies.includes(task.phase)
-        );
-        for (const downTask of downstreamTasks) {
-            if (this._aborted) return false;
-            const downAgent = state.agents.find(a => a.name === downTask.assignee);
-            if (!downAgent || downAgent.id === agentId) continue;
-            await this._conductCollaboration(ceoAgent, agent, downAgent, task.phase, 3, {
-                ceoAgentId: ceoAgent.id,
-                teamAgentIds: teamAgents.map(teamAgent => teamAgent.id),
-                decomposition: state.decomposition,
-                completedPhases: [...completedPhases],
-                currentPhase: task.phase,
-            });
-            if (this._aborted) return false;
-        }
-
-        await this._delay(800);
-        return true;
+        return finalizeAgentPhase(this, ceoAgent, agent, task, completedPhases, teamAgents, phaseStartedAt);
     }
 
-    /**
-     * 等待董事长的人工协助（如扫码/验证码等）
-     * 调用方须通过 _humanGate 串行化，保证同一时刻仅一个挂起回调
-     */
     async _requestHumanIntervention(agent, currentSubtask, checkpointPayload = null) {
         const { generation: gen, gateId } = this._captureGateToken();
         return new Promise(resolve => {
@@ -3818,15 +3415,18 @@ ${modelList}
         } catch (_) { /* ignore */ }
 
         // 终态不得停在 waiting_for_*
+        let terminalSync = Promise.resolve(null);
         try {
             const st = this.getState()?.systemStatus;
             if (st === 'waiting_for_config' || st === 'waiting_for_human' || st === 'waiting_for_decision' || st === 'running' || st === 'paused') {
                 this.dispatch({ type: 'SET_STATUS', payload: 'blocked' });
+                terminalSync = this.flushGatewaySync();
             }
         } catch (_) { /* ignore */ }
 
         logger.info('CEO', `执行已停止：${reason}`);
         recordTimelineEvent('state_change', { agentName: 'CEO', detail: `停止：${reason}` });
+        return terminalSync;
     }
 }
 

@@ -87,7 +87,7 @@ test('submitObjectiveCommand starts a new runner and dispatches chairman message
     assert.equal(actions[1].payload.role, '董事长');
 });
 
-test('submitObjectiveCommand stays noop while workflow status blocks submission', { concurrency: false }, async () => {
+test('submitObjectiveCommand stays noop while human or decision gates block submission', { concurrency: false }, async () => {
     const { submitObjectiveCommand } = await importFreshFromRoot('src/components/commandInputLogic.js');
 
     let cleared = false;
@@ -108,6 +108,20 @@ test('submitObjectiveCommand stays noop while workflow status blocks submission'
     });
 
     assert.equal(result.status, 'noop');
+    assert.equal(cleared, false);
+    assert.equal(actions.length, 0);
+
+    const decisionResult = submitObjectiveCommand({
+        objective: '决策门禁期间的新目标',
+        systemStatus: 'waiting_for_decision',
+        dispatch: (action) => actions.push(action),
+        getSnapshot: () => ({}),
+        clearRunnerImpl: () => {
+            cleared = true;
+        },
+        replaceRunnerImpl: () => ({ start() {} }),
+    });
+    assert.equal(decisionResult.status, 'noop');
     assert.equal(cleared, false);
     assert.equal(actions.length, 0);
 });

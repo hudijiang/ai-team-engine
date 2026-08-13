@@ -3,9 +3,10 @@
  * 文件落盘后，创建请求结束后（甚至新 handler 实例）仍可按 id 读回。
  * 这是记录耐久性，不是浏览器关页后继续跑 Agent。
  */
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { redactSensitive } from '../src/utils/sensitiveData.js';
 
 const ALLOWED_STATUS = new Set([
     'created',
@@ -38,17 +39,42 @@ export function createRunStore(options = {}) {
         || (options.dir ? join(options.dir, 'runs.json') : null);
     const now = typeof options.now === 'function' ? options.now : () => new Date().toISOString();
     const createId = typeof options.createId === 'function' ? options.createId : () => randomUUID();
-    let memory = loadFromDisk(filePath);
+    let diskCorrupt = false;
+    let memory = new Map();
+    try {
+        memory = loadFromDisk(filePath);
+    } catch (err) {
+        if (err?.code === 'CORRUPT') diskCorrupt = true;
+        else throw err;
+    }
 
     function persist() {
-        if (!filePath) return;
+        if (!filePath || diskCorrupt) return;
         mkdirSync(dirname(filePath), { recursive: true });
-        writeFileSync(filePath, JSON.stringify({ records: [...memory.values()] }, null, 2), 'utf8');
+        const tmpPath = `${filePath}.${process.pid}.tmp`;
+        const payload = JSON.stringify({ records: [...memory.values()] }, null, 2);
+        writeFileSync(tmpPath, payload, 'utf8');
+        renameSync(tmpPath, filePath);
+        try {
+            writeFileSync(`${filePath}.bak`, payload, 'utf8');
+        } catch (_) { /* backup is best-effort */ }
     }
 
     function reloadIfDurable() {
         if (!filePath) return;
-        memory = loadFromDisk(filePath);
+        if (diskCorrupt) {
+            const err = new Error('run_store_corrupt');
+            err.code = 'CORRUPT';
+            throw err;
+        }
+        try {
+            memory = loadFromDisk(filePath);
+        } catch (err) {
+            if (err?.code === 'CORRUPT') {
+                diskCorrupt = true;
+            }
+            throw err;
+        }
     }
 
     return {
@@ -57,6 +83,7 @@ export function createRunStore(options = {}) {
             const record = normalizeRecord({
                 ...sanitizeInput(input),
                 id: createId(),
+                revision: 1,
                 createdAt: now(),
                 updatedAt: now(),
             });
@@ -80,6 +107,11 @@ export function createRunStore(options = {}) {
                 throw err;
             }
             const patch = sanitizeInput(input, { allowPartial: true });
+            if (input.revision != null && Number(input.revision) !== Number(current.revision)) {
+                const err = new Error(`stale_revision:${input.revision}!=${current.revision}`);
+                err.code = 'STALE_REVISION';
+                throw err;
+            }
             if (patch.status && !canTransition(current.status, patch.status)) {
                 const err = new Error(`invalid_status_transition:${current.status}->${patch.status}`);
                 err.code = 'INVALID_TRANSITION';
@@ -89,6 +121,7 @@ export function createRunStore(options = {}) {
                 ...current,
                 ...patch,
                 id: current.id,
+                revision: Number(current.revision || 1) + 1,
                 createdAt: current.createdAt,
                 updatedAt: now(),
             });
@@ -100,6 +133,23 @@ export function createRunStore(options = {}) {
         list() {
             reloadIfDurable();
             return [...memory.values()].map(record => ({ ...record }));
+        },
+
+        remove(id) {
+            reloadIfDurable();
+            const key = String(id || '');
+            if (!memory.has(key)) {
+                const err = new Error('run_not_found');
+                err.code = 'NOT_FOUND';
+                throw err;
+            }
+            memory.delete(key);
+            persist();
+            return true;
+        },
+
+        isCorrupt() {
+            return diskCorrupt;
         },
     };
 }
@@ -113,8 +163,11 @@ function loadFromDisk(filePath) {
         for (const row of rows) {
             if (row?.id) map.set(row.id, normalizeRecord(row));
         }
-    } catch (_) {
-        return map;
+    } catch (err) {
+        if (err?.code === 'ENOENT') return map;
+        const corrupt = new Error('run_store_corrupt');
+        corrupt.code = 'CORRUPT';
+        throw corrupt;
     }
     return map;
 }
@@ -132,7 +185,7 @@ function sanitizeInput(input = {}, { allowPartial = false } = {}) {
     }
     const out = {};
     if (!allowPartial || input.objective != null) {
-        out.objective = String(input.objective || '').slice(0, 500);
+        out.objective = redactSensitive(String(input.objective || '')).slice(0, 500);
     }
     if (!allowPartial || input.status != null) {
         out.status = ALLOWED_STATUS.has(input.status) ? input.status : (allowPartial ? undefined : 'created');
@@ -150,6 +203,11 @@ function sanitizeInput(input = {}, { allowPartial = false } = {}) {
     if (Array.isArray(input.completedPhases)) {
         out.completedPhases = input.completedPhases.map(phase => String(phase).slice(0, 80)).slice(0, 32);
     }
+    if (input.lastError !== undefined) {
+        out.lastError = input.lastError
+            ? redactSensitive(String(input.lastError)).slice(0, 400)
+            : null;
+    }
     return out;
 }
 
@@ -163,6 +221,8 @@ function normalizeRecord(row = {}) {
         checkpointType: row.checkpointType || null,
         currentPhase: row.currentPhase || null,
         completedPhases: Array.isArray(row.completedPhases) ? row.completedPhases : [],
+        lastError: row.lastError || null,
+        revision: Number(row.revision) > 0 ? Number(row.revision) : 1,
         createdAt: row.createdAt || null,
         updatedAt: row.updatedAt || null,
     };

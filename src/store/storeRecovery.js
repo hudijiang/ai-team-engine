@@ -2,6 +2,7 @@ import {
     isValidRunningCheckpoint,
     summarizeRunningCheckpoint,
 } from '../engine/workflowCheckpoint.js';
+import { redactSensitive } from '../utils/sensitiveData.js';
 
 const TRANSIENT_RUNTIME_STATUSES = new Set(['running', 'paused']);
 
@@ -109,7 +110,7 @@ export function alignStateWithGatewayRun(state, gatewayRecord) {
                 collaborators: ['CEO'],
                 dialogue: [
                     `Gateway 仍保存运行记录 ${gatewayRecord.id}。`,
-                    `目标：「${String(gatewayRecord.objective || '').slice(0, 80)}」，状态：${gatewayRecord.status}。`,
+                    `目标：「${redactSensitive(String(gatewayRecord.objective || '')).slice(0, 80)}」，状态：${gatewayRecord.status}。`,
                     gatewayRecord.checkpointType
                         ? `最后检查点类型：${gatewayRecord.checkpointType}${gatewayRecord.currentPhase ? `（${gatewayRecord.currentPhase}）` : ''}。`
                         : '本地检查点缺失，无法自动续跑 Agent。',
@@ -132,6 +133,7 @@ export function sanitizeLoadedState(state) {
     const next = {
         ...state,
         messages: [...(state.messages || [])],
+        inbox: Array.isArray(state.inbox) ? [...state.inbox] : [],
         workflowCheckpoint: state.workflowCheckpoint || null,
     };
 

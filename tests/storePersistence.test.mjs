@@ -53,6 +53,7 @@ test('store uses bootstrap state immediately and then hydrates richer full state
     assert.equal(useStore.getState().currentSessionId, 'full-session');
     assert.equal(useStore.getState().messages.length, 3);
     assert.equal(useStore.getState().promptLogs.length, 2);
+    assert.equal(useStore.getState().agents[0].model, '');
 });
 
 test('store hydration does not overwrite newer user mutations that happen before async hydrate completes', { concurrency: false }, async () => {
@@ -81,6 +82,86 @@ test('store hydration does not overwrite newer user mutations that happen before
 
     const full = readIndexedValue('state:full');
     assert.equal(full.currentObjective, 'fresh-objective');
+});
+
+test('store hydration rechecks mutations after delayed Gateway reconciliation', { concurrency: false }, async () => {
+    localStorage.setItem('agent-auto-state', JSON.stringify({
+        currentObjective: 'bootstrap-objective',
+        systemStatus: 'idle',
+        messages: [],
+        gatewayRunId: 'run-delayed',
+    }));
+    writeIndexedValue('state:full', {
+        currentObjective: 'stale-full-objective',
+        systemStatus: 'completed',
+        messages: [{ role: '系统', dialogue: ['stale'] }],
+        gatewayRunId: 'run-delayed',
+    });
+
+    // Store modules share the canonical Gateway config dependency. Mutate that
+    // same resource rather than a query-string-isolated test instance.
+    const { saveGatewayConfig } = await import('../src/engine/gatewayConfig.js');
+    saveGatewayConfig({
+        useGateway: true,
+        gatewayUrl: 'http://gateway.local',
+        accessToken: 'gateway-token',
+    });
+    await settleAsync(6);
+
+    const previousFetch = globalThis.fetch;
+    let releaseResponse;
+    let markFetchStarted;
+    const fetchStarted = new Promise(resolve => { markFetchStarted = resolve; });
+    const delayedBody = new Promise(resolve => { releaseResponse = resolve; });
+    globalThis.fetch = async () => {
+        markFetchStarted();
+        return {
+            ok: true,
+            status: 200,
+            json: async () => delayedBody,
+        };
+    };
+
+    try {
+        const { useStore } = await importFreshFromRoot('src/store/store.js');
+        await fetchStarted;
+        useStore.getState().dispatch({ type: 'SET_OBJECTIVE', payload: 'fresh-during-gateway' });
+        releaseResponse({
+            record: {
+                id: 'run-delayed',
+                objective: 'stale-full-objective',
+                status: 'completed',
+            },
+        });
+        await settleAsync(12);
+
+        assert.equal(useStore.getState().hasHydrated, true);
+        assert.equal(useStore.getState().currentObjective, 'fresh-during-gateway');
+        assert.equal(useStore.getState().systemStatus, 'running');
+    } finally {
+        globalThis.fetch = previousFetch;
+    }
+});
+
+test('hydration sanitizes inbox entries written by older versions', { concurrency: false }, async () => {
+    writeIndexedValue('state:full', {
+        currentObjective: 'restore',
+        systemStatus: 'completed',
+        messages: [],
+        inbox: [{
+            from: 'A',
+            to: 'B',
+            content: ['credential sk-proj-1234567890abcdefghijklmnop'],
+        }],
+    });
+
+    const { useStore } = await importFreshFromRoot('src/store/store.js');
+    await useStore.getState().hydrate();
+    await settleAsync(4);
+
+    const serialized = JSON.stringify(useStore.getState().inbox);
+    assert.equal(serialized.includes('sk-proj-1234567890abcdefghijklmnop'), false);
+    assert.match(serialized, /REDACTED/);
 });
 
 test('store persists a trimmed bootstrap cache while keeping the full message history in IndexedDB', { concurrency: false }, async () => {

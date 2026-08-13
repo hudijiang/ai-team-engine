@@ -20,28 +20,28 @@ npm run preview
 
 | 层 | 存什么 |
 |----|--------|
-| **IndexedDB** | 会话、消息、检查点、完整 API Key、知识库全文等 |
+| **IndexedDB** | 会话、消息、检查点、知识库全文；直连模式的完整供应商 API Key；Gateway 模式的访问 Token |
 | **localStorage** | 去敏 bootstrap（启动用，不含完整密钥） |
 | **内存** | 正在跑的 `CEOAgentRunner`、Abort 作用域 |
 | **Gateway 磁盘** | `data/gateway-runs/runs.json` 运行记录（需 `npm run gateway`） |
 
 「所有数据都在 localStorage」已过时。
 
-出站请求由**浏览器**发往你填写的模型 URL（及可选的简化 HTTP 工具桥）。风险是密钥/Prompt 外泄、恶意代理、访问本机或内网服务——**不是**服务端 SSRF。若以后由 Gateway 代发，才需要按 SSRF 做 URL 白名单。
+直连模式由浏览器向用户填写的模型 URL 发送供应商 Key 与 Prompt；Gateway 模式由浏览器向本机 Gateway 发送 Token、模型 ID 与 Prompt，再由 Gateway 代发。前者不是服务端 SSRF；后者已按服务端 SSRF 边界使用固定 Provider 注册表、主机白名单与私网拒绝。
 
 ## 产品范围
 
-- **当前**：单租户、本机 BYOK、PoC / 内部演示。
-- **下一阶段（单租户生产）**：最小 Gateway——密钥托管、代理模型调用、会话持久化、审计、限流、主路径 E2E。
-- **更后**：多租户隔离与跨租户账单。**不要**把多租户当本阶段 P0。
+- **当前**：单租户、本机 BYOK 或本机 Gateway。
+- **后续仍只做单租户**：主路径可靠、运行记录、本机安全。
+- **不规划**：对外 SaaS、多租户、跨租户账单。
 
 ## 最小单租户 Gateway（已落地骨架）
 
 目标是先解除「浏览器持有 raw key」；关页即停仍在。详见 [gateway/README.md](./gateway/README.md)。
 
-已具备：环境变量密钥、`POST /api/llm/chat`、`POST/GET/PATCH /api/runs` 记录与检查点对账、上游白名单（服务端 SSRF 防护）、RPM 限流、脱敏审计行。
+已具备：环境变量密钥、按明确 Provider 获取/填写模型 ID、`POST/GET/PATCH /api/runs`（revision）、未知 Provider 拒绝、请求体/上游超时与响应限制、CORS 可配置。默认绑定 127.0.0.1。
 
-尚未具备：关页后继续跑 Agent、多租户、Docker、生产 SLA。
+尚未具备：关页后继续跑 Agent、Docker。这些若做也只服务单租户，不会做成 SaaS。
 
 大爆炸拆完 `ceoAgent.js` 再做 Gateway **不是**前置条件；门禁已抽到 `src/engine/gateController.js`，可继续增量拆阶段运行器。
 
@@ -78,9 +78,9 @@ POST   /api/llm/chat
 
 前端「配置 → 后端模式」若开启，会向 `backendUrl` 发带 Bearer 的存储请求，失败则降级本地 IndexedDB/bootstrap。没有对端时不要打开该开关。
 
-## 安全（Gateway 落地后才适用）
+## 安全（当前 Gateway 边界）
 
-- 密钥只存在服务端；前端只持会话 cookie / 短期 token
+- 供应商密钥只存在 Gateway 进程环境变量；前端持静态 Gateway Token（尚无登录、短期会话或轮换服务）
 - 模型与工具 URL **白名单**（此时才按服务端 SSRF 防护）
 - 限流、审计不可关
 - HTTPS；CORS 收紧到实际前端源

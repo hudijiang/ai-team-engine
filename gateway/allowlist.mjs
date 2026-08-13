@@ -1,3 +1,5 @@
+import { getKnownProvider } from '../src/engine/providerCatalog.js';
+
 /** 默认允许代发的公网模型主机（单租户 Gateway SSRF 防护） */
 export const DEFAULT_ALLOW_HOSTS = new Set([
     'api.openai.com',
@@ -54,20 +56,17 @@ export function assertAllowedUpstream(rawUrl, allowHosts = DEFAULT_ALLOW_HOSTS) 
 }
 
 export function resolveUpstream(provider, model) {
-    const id = String(provider || '').toLowerCase();
-    if (id === 'anthropic') {
-        return {
-            url: 'https://api.anthropic.com/v1/messages',
-            kind: 'anthropic',
-            model,
-        };
+    const known = getKnownProvider(provider);
+    if (!known) {
+        const err = new Error(`unknown_provider:${provider || ''}`);
+        err.code = 'UNKNOWN_PROVIDER';
+        throw err;
     }
-    const openaiCompat = {
-        openai: 'https://api.openai.com/v1/chat/completions',
-        deepseek: 'https://api.deepseek.com/v1/chat/completions',
-        alibaba: 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
-        zhipu: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+    return {
+        url: known.chatUrl,
+        modelsUrl: known.modelsUrl,
+        kind: known.kind,
+        model,
+        provider: known.id,
     };
-    const url = openaiCompat[id] || openaiCompat.openai;
-    return { url, kind: 'openai', model };
 }

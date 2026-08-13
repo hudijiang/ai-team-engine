@@ -6,12 +6,13 @@ import {
 } from './allowlist.mjs';
 import { createTokenBucket } from './rateLimit.mjs';
 import { createRunStore } from './runStore.mjs';
+import { KNOWN_PROVIDERS } from '../src/engine/providerCatalog.js';
 
 function corsHeaders(origin) {
     return {
         'Access-Control-Allow-Origin': origin || '*',
         'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-        'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
     };
 }
 
@@ -27,7 +28,8 @@ function json(status, payload, extraHeaders = {}, origin = '*') {
 function withCors(result, origin) {
     return {
         ...result,
-        headers: { ...corsHeaders(origin), ...(result.headers || {}) },
+        // 最终配置必须覆盖 json() 的默认值，不能让 '*' 反向覆盖白名单。
+        headers: { ...(result.headers || {}), ...corsHeaders(origin) },
     };
 }
 
@@ -84,6 +86,11 @@ export function createGatewayHandler(options = {}) {
     const bucket = options.bucket || createTokenBucket({ rpm: options.rpm || 30 });
     const fetchImpl = options.fetchImpl || globalThis.fetch;
     const corsOrigin = options.corsOrigin || '*';
+    const maxBodyChars = Number(options.maxBodyChars || 512_000);
+    const maxMessages = Number(options.maxMessages || 40);
+    const maxMessageChars = Number(options.maxMessageChars || 16_000);
+    const maxUpstreamChars = Number(options.maxUpstreamChars || 512_000);
+    const upstreamTimeoutMs = Number(options.upstreamTimeoutMs || 90_000);
     const runStore = options.runStore || createRunStore({ filePath: options.runStoreFilePath || null });
     const audit = options.audit || ((entry) => {
         try {
@@ -104,6 +111,9 @@ export function createGatewayHandler(options = {}) {
             } catch (err) {
                 if (err?.code === 'SECRET_REJECTED') {
                     return json(400, { error: 'provider_key_not_accepted' });
+                }
+                if (err?.code === 'CORRUPT') {
+                    return json(503, { error: 'run_store_corrupt' });
                 }
                 throw err;
             }
@@ -127,16 +137,36 @@ export function createGatewayHandler(options = {}) {
                 if (err?.code === 'INVALID_TRANSITION') {
                     return json(409, { error: 'invalid_status_transition', reason: err.message });
                 }
+                if (err?.code === 'STALE_REVISION') {
+                    return json(409, {
+                        error: 'stale_revision',
+                        reason: err.message,
+                        record: runStore.get(runId),
+                    });
+                }
+                if (err?.code === 'CORRUPT') {
+                    return json(503, { error: 'run_store_corrupt' });
+                }
                 throw err;
             }
         }
-        if (method === 'GET' && runId) {
-            const record = runStore.get(runId);
-            if (!record) return json(404, { error: 'run_not_found' });
-            return json(200, { record });
-        }
-        if (method === 'GET' && !runId) {
-            return json(200, { records: runStore.list() });
+        try {
+            if (method === 'DELETE' && runId) {
+                runStore.remove(runId);
+                return json(200, { ok: true, id: runId });
+            }
+            if (method === 'GET' && runId) {
+                const record = runStore.get(runId);
+                if (!record) return json(404, { error: 'run_not_found' });
+                return json(200, { record });
+            }
+            if (method === 'GET' && !runId) {
+                return json(200, { records: runStore.list() });
+            }
+        } catch (err) {
+            if (err?.code === 'NOT_FOUND') return json(404, { error: 'run_not_found' });
+            if (err?.code === 'CORRUPT') return json(503, { error: 'run_store_corrupt' });
+            throw err;
         }
         return json(405, { error: 'method_not_allowed' });
     }
@@ -160,6 +190,31 @@ export function createGatewayHandler(options = {}) {
                 role: 'single-tenant-llm-gateway',
                 persist: true,
             }, {}, corsOrigin);
+        }
+
+        if (typeof request.body === 'string' && request.body.length > maxBodyChars) {
+            return json(413, { error: 'payload_too_large' });
+        }
+
+        if (method === 'GET' && url.pathname === '/api/providers') {
+            if (!token || readBearer(request.headers) !== token) {
+                return json(401, { error: 'unauthorized' });
+            }
+            return json(200, {
+                providers: KNOWN_PROVIDERS.map(item => ({
+                    id: item.id,
+                    name: item.name,
+                    kind: item.kind,
+                    configured: !!providerKeys[item.id],
+                })),
+            });
+        }
+
+        if (method === 'GET' && url.pathname === '/api/models') {
+            if (!token || readBearer(request.headers) !== token) {
+                return json(401, { error: 'unauthorized' });
+            }
+            return handleModelsList(url.searchParams.get('provider'));
         }
 
         const runMatch = url.pathname.match(/^\/api\/runs(?:\/([^/]+))?$/);
@@ -198,19 +253,31 @@ export function createGatewayHandler(options = {}) {
             return json(400, { error: 'provider_key_not_accepted' });
         }
 
-        const provider = String(payload.provider || 'openai').toLowerCase();
+        const provider = String(payload.provider || '').toLowerCase();
         const model = payload.model || '';
         const messages = Array.isArray(payload.messages) ? payload.messages : [];
         if (!model || messages.length === 0) {
             return json(400, { error: 'model_and_messages_required' });
         }
-
-        const apiKey = providerKeys[provider] || providerKeys.custom || '';
-        if (!apiKey) {
-            return json(503, { error: 'provider_key_not_configured', provider });
+        if (messages.length > maxMessages || messages.some(m => String(m?.content || '').length > maxMessageChars)) {
+            return json(413, { error: 'messages_too_large' });
         }
 
-        const upstream = resolveUpstream(provider, model);
+        let upstream;
+        try {
+            upstream = resolveUpstream(provider, model);
+        } catch (err) {
+            if (err?.code === 'UNKNOWN_PROVIDER') {
+                return json(400, { error: 'unknown_provider', provider });
+            }
+            throw err;
+        }
+
+        const apiKey = providerKeys[upstream.provider] || '';
+        if (!apiKey) {
+            return json(503, { error: 'provider_key_not_configured', provider: upstream.provider });
+        }
+
         try {
             assertAllowedUpstream(upstream.url, allowHosts);
         } catch (err) {
@@ -218,6 +285,8 @@ export function createGatewayHandler(options = {}) {
         }
 
         const started = Date.now();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), upstreamTimeoutMs);
         try {
             const res = await fetchImpl(upstream.url, {
                 method: 'POST',
@@ -227,8 +296,9 @@ export function createGatewayHandler(options = {}) {
                     messages,
                     stream: false,
                 })),
+                signal: controller.signal,
             });
-            const text = await res.text();
+            const text = await readLimitedText(res, maxUpstreamChars);
             let parsed = text;
             try {
                 parsed = JSON.parse(text);
@@ -264,8 +334,93 @@ export function createGatewayHandler(options = {}) {
                 error: redactSensitive(err?.message || 'fetch_failed'),
             });
             return json(502, { error: 'upstream_unreachable' });
+        } finally {
+            clearTimeout(timer);
         }
     };
+
+    async function handleModelsList(providerId) {
+        let upstream;
+        try {
+            upstream = resolveUpstream(providerId, '');
+        } catch (err) {
+            if (err?.code === 'UNKNOWN_PROVIDER') {
+                return json(400, { error: 'unknown_provider', provider: providerId });
+            }
+            throw err;
+        }
+        const apiKey = providerKeys[upstream.provider] || '';
+        if (!apiKey) {
+            return json(503, { error: 'provider_key_not_configured', provider: upstream.provider });
+        }
+        try {
+            assertAllowedUpstream(upstream.modelsUrl, allowHosts);
+        } catch (err) {
+            return json(403, { error: 'upstream_denied', reason: err.message });
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), Math.min(upstreamTimeoutMs, 15_000));
+        try {
+            const headers = upstream.kind === 'anthropic'
+                ? { 'x-api-key': apiKey, 'anthropic-version': '2024-01-01' }
+                : { Authorization: `Bearer ${apiKey}` };
+            const res = await fetchImpl(upstream.modelsUrl, { headers, signal: controller.signal });
+            const text = await readLimitedText(res, maxUpstreamChars);
+            if (!res.ok) {
+                return json(res.status, { error: 'upstream_error', detail: redactSensitive(text.slice(0, 200)) });
+            }
+            const parsed = JSON.parse(text);
+            const models = Array.isArray(parsed.data)
+                ? parsed.data.map(item => ({ id: item.id, name: item.id || item.name, provider: upstream.provider }))
+                : [];
+            return json(200, { models });
+        } catch (err) {
+            return json(502, { error: 'upstream_unreachable', reason: err?.message || 'fetch_failed' });
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+}
+
+async function readLimitedText(res, maxChars) {
+    const declaredLength = Number(res?.headers?.get?.('content-length') || 0);
+    if (declaredLength > maxChars) throwUpstreamTooLarge();
+
+    if (res?.body?.getReader) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let totalBytes = 0;
+        let text = '';
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                totalBytes += value?.byteLength || 0;
+                if (totalBytes > maxChars) {
+                    try { await reader.cancel('upstream_response_too_large'); } catch (_) { /* ignore */ }
+                    throwUpstreamTooLarge();
+                }
+                text += decoder.decode(value, { stream: true });
+            }
+            text += decoder.decode();
+            return text;
+        } finally {
+            try { reader.releaseLock(); } catch (_) { /* ignore */ }
+        }
+    }
+
+    if (typeof res?.text === 'function') {
+        const text = String(await res.text());
+        if (new TextEncoder().encode(text).byteLength > maxChars) throwUpstreamTooLarge();
+        return text;
+    }
+    return '';
+}
+
+function throwUpstreamTooLarge() {
+    const err = new Error('upstream_response_too_large');
+    err.code = 'UPSTREAM_TOO_LARGE';
+    throw err;
 }
 
 function extractContent(kind, parsed) {

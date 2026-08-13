@@ -6,8 +6,8 @@ A browser-based visual multi-agent orchestration engine for planning and collabo
 
 It maps an enterprise-style hierarchy—**Chairman → CEO → specialist workers**—onto LLM agents: natural-language strategic goals are decomposed into schedulable phases, workers run in parallel where dependencies allow, and humans are brought in at critical gates (HITL).
 
-> **Positioning**: local single-user / internal PoC / **BYOK (bring your own key) tech preview**.  
-> This is **not** multi-tenant enterprise SaaS and does **not** claim commercial SLAs, compliance certification, or hosted secrets. See [Positioning & commercial boundaries](#positioning--commercial-boundaries).
+> **Positioning**: local single-user / single-tenant preview (optional local Gateway).  
+> **Out of scope by design:** public SaaS, multi-tenant isolation, or cross-tenant billing. See [Positioning & commercial boundaries](#positioning--commercial-boundaries).
 
 ---
 
@@ -18,7 +18,7 @@ flowchart TD
     A[Chairman enters strategic goal] --> B[CEO analyzes and decomposes]
     B --> C[Form team and pre-assign models]
     C --> D[waiting_for_config review models]
-    D --> E[API Key preflight]
+    D --> E[Model and connection preflight]
     E -->|OK| F[Schedule phases by dependency]
     E -->|Missing| G[Refuse run and prompt config]
     F --> H[Workers run subtasks]
@@ -81,7 +81,7 @@ flowchart TD
 ### Privacy & observability
 
 - **Sensitive-data redaction**: Message boundary, logs, timeline, and deliverable reports redact common secret/OTP patterns (see `src/utils/sensitiveData.js`).
-- **Key storage**: Full API keys in IndexedDB; `localStorage` holds a redacted bootstrap cache only.
+- **Key storage**: Direct mode keeps full provider API keys in IndexedDB. Gateway mode keeps only the Gateway token in the browser while provider keys stay in the Gateway process environment. The `localStorage` bootstrap contains no full secret.
 - **Cost / tokens**: Usage tracked per agent and model.
 - **Prompt Inspector / timeline replay**: Local PoC-level debugging and process review.
 
@@ -91,7 +91,7 @@ flowchart TD
 - **Export**: Markdown / HTML / PDF (via browser print).
 - **Session archive**: Restore history; inject cross-session summaries into new runs.
 
-Some features are demo scaffolding: keyword knowledge base (not vector RAG), role plugin templates, a simplified HTTP tool bridge, and local workspace structs. **This repo has no deployable backend.** A control plane is planned only—see [DEPLOYMENT.md](./DEPLOYMENT.md).
+Some features are demo scaffolding: keyword knowledge base (not vector RAG), role plugin templates, a simplified HTTP tool bridge, and local workspace structs. The repo includes an **optional local single-tenant Gateway**, but no durable server-side agent runner or release-grade control plane—see [DEPLOYMENT.md](./DEPLOYMENT.md).
 
 ---
 
@@ -104,7 +104,7 @@ Some features are demo scaffolding: keyword knowledge base (not vector RAG), rol
 | Styling | Vanilla CSS variables (no external UI kit) |
 | Orchestration core | `src/engine/ceoAgent.js` and neighbors |
 | Safety-related | CSP (`index.html`), DOMPurify, `sensitiveData`, tool policy |
-| Backend | None by default; browser calls your configured model APIs (BYOK) |
+| Backend | Direct by default; optional local single-tenant Gateway for provider keys and run records |
 
 ### Engine modules (sketch)
 
@@ -150,6 +150,8 @@ Open the URL printed by the terminal (often `http://localhost:5173`).
 npm test          # Node built-in test runner regressions
 npm run check     # test + production build
 npm run build     # tsc && vite build
+npm run gateway   # local single-tenant Gateway
+npm run dev:all   # Vite + Gateway together
 ```
 
 CI can run `npm run check` on push/PR.
@@ -159,7 +161,9 @@ CI can run `npm run check` on push/PR.
 ## How to use
 
 1. **Configure models**  
-   Right sidebar **⚙️ Config**: set provider endpoint and API key (OpenAI / Anthropic / Google / DeepSeek / Zhipu adapters, etc.). Keys stay in local browser storage.
+   - Direct mode: set a provider endpoint and API key, then fetch models.
+   - Gateway mode: start `npm run gateway`, enter its URL/token under **⚙️ Config**, then fetch models from the server or manually add a model ID inside an explicit provider group. No provider key is stored in the browser.
+   - Explicitly select a CEO model before publishing a goal, then review worker models after team creation.
 
 2. **Publish a goal**  
    Example: `Plan a local lifestyle mini-program` → **Publish** → review team & models → **Start execution**.
@@ -182,23 +186,24 @@ CI can run `npm run check` on push/PR.
 
 ## Positioning & commercial boundaries
 
-Current scope is **single-tenant / local BYOK**. Multi-tenant isolation and cross-tenant billing are **not** P0 for this phase.
+Scope now and later is **single-tenant**: one machine for one operator.  
+**Will not build:** public SaaS, multi-tenant isolation, or cross-tenant billing.
 
-| Suitable for | Not suitable (current build) |
-|--------------|------------------------------|
-| Local demos, internal PoC | Public paid SaaS |
-| BYOK R&D experiments | Hosted secrets; work that must survive closing the tab |
-| Orchestration + HITL flow validation | Hard compliance audits / SLA |
+| Suitable for | Out of scope / not built |
+|--------------|--------------------------|
+| Local demos, internal single-tenant trials | Public SaaS / multi-tenant |
+| BYOK or a local Gateway holding keys | Agents continuing after the tab closes (not built) |
+| Orchestration + HITL validation | Commercial SLA / compliance certification |
 
 **Known limits:**
 
-- No standalone gateway or job queue; execution lives in the browser tab lifecycle.
-- The **browser** sends requests to whatever URL you configure: key/prompt leakage, malicious reverse proxies, and access to localhost/LAN services. That is **not** server-side SSRF. SSRF becomes a Gateway concern only when the server starts proxying (then use URL allowlists).
+- An optional local single-tenant Gateway exists, but there is no server-side job queue; execution lives in the browser tab lifecycle.
+- In **direct mode**, the browser sends vendor keys and prompts to the configured URL. In **Gateway mode**, it sends a Gateway token, model ID, and prompt to the local Gateway; vendor keys remain in its environment. The proxy uses an exact provider registry, host allowlist, and private-host denial.
 - Redaction is best-effort and cannot guarantee 100% coverage of every language or format.
 - Default tools are read-oriented builtins; real web search, code sandboxes, and standard MCP need extra integration.
 - No server-side delete/export compliance workflow.
 
-**Single-tenant blockers to a deliverable:** hosted keys, durable execution, audit, rate limits, main-path E2E—not multi-tenant billing.
+**If this single-tenant preview should get more reliable, prioritize:** a keyless Gateway happy path, run-record reconciliation, local network bounds, and main-path regressions. Not billing.
 
 More: [PRIVACY.md](./PRIVACY.md) · [DEPLOYMENT.md](./DEPLOYMENT.md)
 
@@ -209,9 +214,9 @@ More: [PRIVACY.md](./PRIVACY.md) · [DEPLOYMENT.md](./DEPLOYMENT.md)
 Work in parallel; do not wait to finish a 3.8k-line CEO split before any Gateway:
 
 1. **Incremental split**: gates live in `src/engine/gateController.js`; next is the phase runner
-2. **Minimal single-tenant Gateway**: `npm run gateway` proxies chat, hosts keys, and syncs run records via `POST/GET/PATCH /api/runs` (see [gateway/README.md](./gateway/README.md)). Closing the tab still stops live agents
+2. **Minimal single-tenant Gateway**: with Gateway on, the browser can run without vendor keys (model IDs + token). Run records sync with revision. Closing the tab still stops live agents
 3. Playwright on the main path / optional real-provider smoke tests
-4. Later: tool sandboxes and a visual editor; multi-tenant only after the single-tenant plane is stable
+4. Later (still single-tenant): tool sandboxes and a visual editor. No SaaS.
 
 ---
 

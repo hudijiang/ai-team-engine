@@ -201,7 +201,8 @@ test('runnerRuntime reuses the active runner until replace or clear is called', 
     const runnerB = runtime.getRunner(dispatchB, getStateB);
 
     assert.equal(runnerA, runnerB);
-    assert.equal(runnerB.dispatch, dispatchB);
+    assert.equal(runnerB._rawDispatch, dispatchB);
+    assert.notEqual(runnerB.dispatch, dispatchB);
     assert.equal(runnerB.getState, getStateB);
 
     const replaced = runtime.replaceRunner(dispatchA, getStateA);

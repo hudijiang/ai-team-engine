@@ -182,6 +182,8 @@ test('start builds and reuses a team then persists the configuration gate', asyn
             assert.equal(signal.aborted, false);
             return decomposition;
         },
+        // 老版本/最小实现可能尚未返回 revision；Runner 必须从 1 开始。
+        createGatewayRun: async () => ({ id: 'run-without-revision' }),
     };
     const { runner, state } = createHarness(CEOAgentRunner, [ceo, reused], {
         availableModels: { custom: [{ id: 'worker-model' }] },
@@ -200,6 +202,8 @@ test('start builds and reuses a team then persists the configuration gate', asyn
     assert.ok(state.agents.some(agent => agent.name === '顾问' && agent.currentTask === ''));
     assert.equal(runner.hasPendingExecution(), true);
     assert.equal(runner.isRunning, false);
+    assert.equal(runner._gatewayRunId, 'run-without-revision');
+    assert.equal(runner._gatewayRevision, 1);
 
     runner.isRunning = true;
     await runner.start('ignored');
@@ -231,6 +235,17 @@ test('start blocks on missing CEO and decomposition errors, and treats cancellat
     });
     await cancelled.runner.start('x');
     assert.equal(cancelled.state.systemStatus, 'idle');
+
+    const gatewayUnavailable = createHarness(CEOAgentRunner, [ceo], {}, {
+        decomposeWithLLM: async () => ({
+            objective: 'x', type: 'x', totalPhases: 0, estimatedDuration: 0, roles: [], tasks: [],
+        }),
+        createGatewayRun: async () => {
+            throw new Error('gateway unavailable');
+        },
+    });
+    await gatewayUnavailable.runner.start('x');
+    assert.equal(gatewayUnavailable.state.systemStatus, 'waiting_for_config');
 });
 
 test('resume checks provider configuration, promotes checkpoint, and drives execution', async () => {
@@ -1279,6 +1294,7 @@ test('branch matrix covers lifecycle fallbacks and checkpoint ownership variants
     });
 
     runner._runGateId = null;
+    assert.equal(runner._runGateId, null);
     const firstToken = runner._captureGateToken();
     const secondToken = runner._captureGateToken();
     assert.ok(firstToken.gateId && secondToken.gateId !== firstToken.gateId);
@@ -1949,6 +1965,7 @@ test('branch matrix covers remaining model, checkpoint, planning, QA, and messag
 
     assert.equal(await runner._checkHumanInterventionNeeded({ name: 'x', role: undefined }, '支付'), true);
     runner._callLLMWithRetry = async () => null;
+    assert.equal(await runner._checkHumanInterventionNeeded({ name: 'x', role: undefined }, '分析'), true);
     assert.equal(await runner._checkHumanInterventionNeeded(worker, '分析'), true);
 
     const stateOnly = {
@@ -2685,7 +2702,7 @@ test('branch closure covers remaining legacy guards and gate payload defaults', 
 
     // Legacy cold-HITL contexts can omit failures/inFlight/subtasks entirely.
     const cold = createHarness(CEOAgentRunner, [ceo, worker], { decomposition });
-    cold.runner._phaseFailures = [];
+    cold.runner._phaseFailures = null;
     cold.runner._restoreCheckpointContext = () => ({
         ceoAgent: ceo,
         teamAgents: [worker],
@@ -2826,7 +2843,7 @@ test('branch closure covers final falsy fallbacks and abort-finally paths', asyn
         workflowCheckpoint: decisionCheckpoint,
         pendingDecision: { topic: 'A', agentA: worker.name, agentB: reviewer.name, proposals: [] },
     });
-    coldDecision.runner._phaseFailures = [];
+    coldDecision.runner._phaseFailures = null;
     coldDecision.runner._restoreCheckpointContext = () => ({
         ceoAgent: ceo,
         teamAgents: [worker, reviewer],

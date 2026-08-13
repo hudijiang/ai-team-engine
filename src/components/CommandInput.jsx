@@ -22,6 +22,7 @@ export default function CommandInput() {
     const reset = useStore(s => s.reset);
     const systemStatus = useStore(s => s.systemStatus);
     const workflowCheckpoint = useStore(s => s.workflowCheckpoint);
+    const agents = useStore(s => s.agents) || [];
 
     const isRunning = systemStatus === 'running';
     const isCompleted = systemStatus === 'completed';
@@ -48,6 +49,9 @@ export default function CommandInput() {
         : '';
 
     const [humanInput, setHumanInput] = useState('');
+    const ceoHasModel = agents.some(agent => agent.name === 'CEO' && !!agent.model);
+    const teamMissingModels = agents.filter(agent => agent.name !== 'CEO' && !agent.model);
+    const canStartWithModels = teamMissingModels.length === 0;
 
     useEffect(() => {
         restoreConfigCheckpoint({
@@ -110,8 +114,8 @@ export default function CommandInput() {
         });
     }, [dispatch, getSnapshot]);
 
-    const handleReset = useCallback(() => {
-        clearRunner();
+    const handleReset = useCallback(async () => {
+        await clearRunner();
         reset();
         setInput('');
         setHumanInput('');
@@ -194,12 +198,16 @@ export default function CommandInput() {
             {isWaitingConfig && (
                 <div className="command-input__config-notice">
                     <div className="command-input__config-text">
-                        ⏸️ 团队已组建，请为每位成员选择 AI 模型：
+                        ⏸️ 团队已组建，请为每位成员选择模型 ID（Gateway 模式无需填写供应商 Key）：
+                        {!canStartWithModels && (
+                            <div>还缺模型：{teamMissingModels.map(agent => agent.name).join('、')}</div>
+                        )}
                     </div>
                     <div className="command-input__config-actions">
                         <button
                             className="command-input__start-btn"
                             onClick={handleStartExecution}
+                            disabled={!canStartWithModels}
                             id="start-execution-btn"
                         >
                             🚀 开始执行
@@ -291,14 +299,14 @@ export default function CommandInput() {
                             value={input}
                             onChange={e => setInput(e.target.value)}
                             onKeyDown={handleKeyDown}
-                            placeholder="输入战略目标... (例如: 开发一个电商小程序)"
+                            placeholder={ceoHasModel ? '输入战略目标... (例如: 开发一个电商小程序)' : '请先为 CEO 选择模型，再发布目标'}
                             disabled={isRunning}
                             id="strategic-objective-input"
                         />
                         <button
                             className="command-input__btn"
                             onClick={handleSubmit}
-                            disabled={isRunning || !input.trim()}
+                            disabled={isRunning || !input.trim() || !ceoHasModel}
                             id="submit-objective-btn"
                         >
                             {isRunning ? '执行中...' : '发布'}

@@ -6,8 +6,8 @@
 
 用「董事长 → CEO → 专业员工」的层级协作，把自然语言战略目标拆成可调度阶段，由 LLM Worker 并行执行，并在关键节点引入人工确认（HITL）。
 
-> **定位**：本地单用户 / 内部 PoC / **BYOK（自带密钥）技术预览**。  
-> **不是**企业级多租户 SaaS，也不承诺商用 SLA、合规审计或托管密钥。详见 [产品定位](#产品定位与商用边界)。
+> **定位**：本地单用户 / 内部单租户预览（可选本机 Gateway）。  
+> **不规划**对外 SaaS、多租户或跨租户账单。详见 [产品定位](#产品定位与商用边界)。
 
 ---
 
@@ -18,7 +18,7 @@ flowchart TD
     A[董事长输入战略目标] --> B[CEO 分析并拆解任务]
     B --> C[组建团队并预分配模型]
     C --> D[waiting_for_config 核对模型]
-    D --> E[API Key 前置检查]
+    D --> E[模型与连接配置前置检查]
     E -->|通过| F[按依赖调度阶段]
     E -->|缺失| G[拒绝执行并提示配置]
     F --> H[Worker 执行子任务]
@@ -81,7 +81,7 @@ flowchart TD
 ### 隐私与可观测
 
 - **敏感数据脱敏**：消息边界、日志、时间线、交付报告对常见密钥/验证码模式脱敏（见 `src/utils/sensitiveData.js`）。
-- **密钥存储**：完整 API Key 在 IndexedDB；`localStorage` 仅 bootstrap 去敏缓存。
+- **密钥存储**：直连模式的完整供应商 API Key 在 IndexedDB；Gateway 模式下浏览器只保存 Gateway Token，供应商 Key 位于 Gateway 进程环境变量。`localStorage` bootstrap 不保存完整密钥。
 - **成本 / Token**：按 Agent、模型追踪消耗。
 - **Prompt Inspector / 时间线回放**：调试与过程回看（本地 PoC 级别）。
 
@@ -91,7 +91,7 @@ flowchart TD
 - **交付物导出**：Markdown / HTML / PDF（浏览器打印）。
 - **会话归档**：历史会话恢复与跨会话摘要注入。
 
-部分能力为演示骨架：关键词知识库（非向量 RAG）、角色插件模板、简化 HTTP 工具桥、多人协作数据结构。**本仓库没有可部署的后端实现**；控制平面仍是规划，见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
+部分能力为演示骨架：关键词知识库（非向量 RAG）、角色插件模板、简化 HTTP 工具桥、多人协作数据结构。仓库包含可选的本机单租户 LLM Gateway，但 Agent 仍在浏览器执行；服务端执行器、任务队列与事务控制平面仍是规划，见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
 
 ---
 
@@ -104,7 +104,7 @@ flowchart TD
 | 样式 | 原生 CSS Variables（无外部 UI 框架） |
 | 编排核心 | `src/engine/ceoAgent.js` 及周边模块 |
 | 安全相关 | CSP（`index.html`）、DOMPurify、`sensitiveData`、工具策略 |
-| 后端 | 默认无；浏览器直连你配置的模型 API（BYOK） |
+| 后端 | 默认直连；可选本机单租户 Gateway 代管供应商密钥与运行记录 |
 
 ### 引擎模块（简图）
 
@@ -150,6 +150,8 @@ npm run dev
 npm test          # Node 原生 test runner 回归
 npm run check     # test + production build
 npm run build     # tsc && vite build
+npm run gateway   # 本机单租户 Gateway
+npm run dev:all   # 同时启动前端 + Gateway
 ```
 
 仓库可配置 CI 执行 `npm run check`。
@@ -159,7 +161,9 @@ npm run build     # tsc && vite build
 ## 使用手册
 
 1. **配置模型**  
-   右侧 **⚙️ 配置**：填写供应商 Endpoint 与 API Key（OpenAI / Anthropic / Google / DeepSeek / 智谱等适配）。密钥落在本机浏览器存储。
+   - 直连：填写供应商 Endpoint 与 API Key，再获取模型。
+   - Gateway：先启动 `npm run gateway`，在右侧 **⚙️ 配置**填写 Gateway URL/Token；从服务端获取模型，或在明确的 Provider 分组内手工添加模型 ID。浏览器无需供应商 Key。
+   - 为 CEO 显式选择一个模型后再发布目标；团队组建后继续为 Worker 核对模型。
 
 2. **发布目标**  
    例如：`计划开发一款本地生活微信小程序` → **发布** → 核对团队与模型 → **开始执行**。
@@ -182,23 +186,24 @@ npm run build     # tsc && vite build
 
 ## 产品定位与商用边界
 
-当前范围是**单租户 / 本机 BYOK**。多租户隔离与跨租户账单**不是**本阶段 P0。
+当前与后续都是**单租户**（本机或自托管给一个人用）。  
+**明确不做**：对外 SaaS、多租户、跨租户账单。
 
-| 适合 | 不适合（当前版本） |
-|------|-------------------|
-| 本地演示、内部 PoC | 对外收费 SaaS |
-| BYOK 自研试验 | 密钥托管、关标签页后继续跑任务 |
-| 编排与 HITL 流程验证 | 强合规审计 / SLA |
+| 适合 | 不在规划内 / 尚未做 |
+|------|---------------------|
+| 本地演示、内部单租户试用 | 对外 SaaS / 多租户 |
+| BYOK 或本机 Gateway 持 Key | 关标签页后 Agent 继续跑（尚未做） |
+| 编排与 HITL 流程验证 | 商用 SLA、合规认证 |
 
 **已知边界：**
 
-- 无独立 Gateway / 任务队列；执行在浏览器标签页生命周期内。
-- 请求从**浏览器**发往你填写的 URL：存在密钥与 Prompt 外泄、恶意反向代理、访问本机/内网服务等风险。这不是服务端 SSRF；将来 Gateway 代发请求时才需要单独防 SSRF（URL 白名单等）。
+- 已提供可选的本机单租户 Gateway，但无服务端任务队列；执行仍在浏览器标签页生命周期内。
+- **直连模式**由浏览器向配置 URL 发送供应商 Key 与 Prompt；**Gateway 模式**只向本机 Gateway 发送 Token、模型 ID 和 Prompt，供应商 Key 留在 Gateway 环境变量中。Gateway 代发已使用固定 Provider 注册表、主机白名单和私网拒绝。
 - 脱敏为尽力模式，不能 100% 覆盖所有语言与格式。
 - 内置工具默认只读；真实联网搜索、代码沙箱、标准 MCP 需另接。
 - 无服务端删除/导出合规流程。
 
-**单租户若要接近可交付，阻塞项是：** 密钥托管、持久执行、审计、限流、主路径 E2E。不是多租户账单。
+**单租户若要更好用，优先项是：** Gateway 无 Key 主路径可靠、运行记录对账、本机安全边界、主路径回归。不做多租户账单。
 
 更多说明：[PRIVACY.md](./PRIVACY.md) · [DEPLOYMENT.md](./DEPLOYMENT.md)
 
@@ -209,9 +214,9 @@ npm run build     # tsc && vite build
 并行推进，避免「先拆完 3800 行 CEO 再做 Gateway」的大爆炸：
 
 1. **增量拆分**：门禁已抽出 `src/engine/gateController.js`；下一步是阶段运行器
-2. **最小单租户 Gateway**：`npm run gateway` 可代调 chat、托管密钥，并用 `POST/GET/PATCH /api/runs` 与本地检查点对账（见 [gateway/README.md](./gateway/README.md)）。关页后 **Agent 不会继续跑**
+2. **最小单租户 Gateway**：开启后浏览器可不持供应商 Key（模型 ID + Gateway Token 即可）。`POST/GET/PATCH /api/runs` 带 revision 对账。关页后 **Agent 不会继续跑**
 3. 主路径 Playwright / 真实供应商烟雾测试
-4. 其后：工具沙箱、可视化编排；多租户放到单租户控制平面稳定之后
+4. 其后（仍单租户）：工具沙箱、可视化编排。不做 SaaS
 
 ---
 

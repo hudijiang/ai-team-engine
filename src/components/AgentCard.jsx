@@ -92,8 +92,8 @@ export default function AgentCard({ agent }) {
                             </optgroup>
                         ))
                     ) : (
-                        // 未配置任何 API Provider，引导用户
-                        <option value="" disabled>请先在设置中配置 API Key</option>
+                        // 直连/Gateway 共用模型清单；不把 Gateway 用户误导去填写供应商 Key。
+                        <option value="" disabled>请先在设置中获取或添加模型</option>
                     )}
                 </select>
             </div>

@@ -10,7 +10,8 @@
     "check": "npm run test && npm run build",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "gateway": "node gateway/server.mjs"
+    "gateway": "node gateway/server.mjs",
+    "dev:all": "node scripts/dev-all.mjs"
   },
   "devDependencies": {
     "@types/dompurify": "^3.0.5",

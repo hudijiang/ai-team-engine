@@ -15,12 +15,22 @@ import { createRunStore } from './runStore.mjs';
 
 const PORT = Number(process.env.GATEWAY_PORT || 8787);
 const HOST = process.env.GATEWAY_HOST || '127.0.0.1';
+const MAX_BODY_BYTES = Number(process.env.GATEWAY_MAX_BODY_BYTES || 512_000);
 const DATA_DIR = process.env.GATEWAY_DATA_DIR
     || path.join(process.cwd(), 'data', 'gateway-runs');
+
+const CORS_ORIGIN = Reflect.get(process, 'env').GATEWAY_CORS_ORIGIN || 'http://localhost:5173';
+
+if (HOST === '0.0.0.0') {
+    // eslint-disable-next-line no-console
+    console.warn('[gateway] HOST=0.0.0.0 is not recommended; bind 127.0.0.1 behind a reverse proxy/TLS');
+}
 
 const handler = createGatewayHandler({
     token: process.env.GATEWAY_TOKEN || '',
     rpm: Number(process.env.GATEWAY_RPM || 30),
+    corsOrigin: process.env.GATEWAY_CORS_ORIGIN || 'http://localhost:5173',
+    maxBodyChars: MAX_BODY_BYTES,
     runStore: createRunStore({ dir: DATA_DIR }),
     providerKeys: {
         openai: process.env.OPENAI_API_KEY || '',
@@ -39,7 +49,19 @@ const handler = createGatewayHandler({
 const server = http.createServer(async (req, res) => {
     try {
         const chunks = [];
-        for await (const chunk of req) chunks.push(chunk);
+        let size = 0;
+        for await (const chunk of req) {
+            size += chunk.length;
+            if (size > MAX_BODY_BYTES) {
+                res.writeHead(413, {
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Access-Control-Allow-Origin': CORS_ORIGIN,
+                });
+                res.end(JSON.stringify({ error: 'payload_too_large' }));
+                return;
+            }
+            chunks.push(chunk);
+        }
         const raw = Buffer.concat(chunks).toString('utf8');
         const result = await handler({
             method: req.method || 'GET',
@@ -54,8 +76,12 @@ const server = http.createServer(async (req, res) => {
         });
         res.end(result.body);
     } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: 'internal_error', message: err?.message || 'unknown' }));
+        // 不把文件路径、解析异常等内部细节返回浏览器。
+        res.writeHead(500, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Access-Control-Allow-Origin': CORS_ORIGIN,
+        });
+        res.end(JSON.stringify({ error: 'internal_error' }));
     }
 });
 

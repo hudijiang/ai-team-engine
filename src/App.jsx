@@ -11,6 +11,7 @@ import CostDashboard from './components/CostDashboard';
 import TimelinePlayer from './components/TimelinePlayer';
 import KnowledgePanel from './components/KnowledgePanel';
 import PluginPanel from './components/PluginPanel';
+import GatewayRunsPanel from './components/GatewayRunsPanel';
 import useInboxSubscriber from './hooks/useInboxSubscriber';
 import CommandInput from './components/CommandInput';
 import { useStore } from './store/store';
@@ -51,6 +52,7 @@ export default function App() {
         { key: 'log', icon: '📜', label: '日志' },
         { key: 'deliverables', icon: '📄', label: '报告' },
         { key: 'config', icon: '⚙️', label: '配置' },
+        { key: 'runs', icon: '🗂️', label: '运行' },
     ];
 
     // 高级 Tab（折叠在「更多」中）
@@ -73,15 +75,16 @@ export default function App() {
     ].filter(Boolean).join(' ');
 
     // 新建对话 — 必须同时停止内存中的 runner，避免幽灵执行链
-    const handleNewChat = () => {
+    const handleNewChat = async () => {
         if (systemStatus === 'running') return;
-        clearRunner();
+        await clearRunner();
         dispatch({ type: 'RESET' });
     };
 
     // 切换到历史对话
-    const handleSwitchSession = (sessionId) => {
+    const handleSwitchSession = async (sessionId) => {
         if (systemStatus === 'running') return;
+        await clearRunner();
         dispatch({ type: 'RESTORE_SESSION', payload: sessionId });
     };
 
@@ -308,6 +311,7 @@ export default function App() {
                                 {rightTab === 'plugins' && <PluginPanel />}
                                 {rightTab === 'debug' && <PromptInspector />}
                                 {rightTab === 'config' && <ModelConfigPanel />}
+                                {rightTab === 'runs' && <GatewayRunsPanel />}
                             </div>
                         </>
                     )}

@@ -200,7 +200,7 @@ function agentReducer(state, action) {
         case 'ADD_INBOX': {
             return {
                 ...state,
-                inbox: [...state.inbox, action.payload],
+                inbox: [...state.inbox, sanitizeMessagePayload(action.payload)],
             };
         }
 
@@ -368,7 +368,9 @@ function getInitialState() {
         name: 'CEO',
         role: '首席执行官 - 负责分析董事长需求、拆解任务、创建团队、协调执行',
         color: '#F59E0B',
-        model: 'claude-ops-4.6-thinking',
+        // 不预填一个无法确认供应商归属或服务端是否可用的“幽灵模型”。
+        // 首次使用时必须从已获取/手工添加的模型列表中显式选择。
+        model: '',
     });
     ceoAgent.state = AGENT_STATES.IDLE;
     ceoAgent.currentTask = '等待董事长指令';
@@ -409,7 +411,7 @@ function buildHydratedState(loaded) {
         ...loaded,
         agents: loaded.agents || base.agents,
         messages: safeMessages,
-        inbox: loaded.inbox || base.inbox,
+        inbox: (Array.isArray(loaded.inbox) ? loaded.inbox : base.inbox).map(sanitizeMessagePayload),
         deliverables: loaded.deliverables || base.deliverables,
         sessionHistory: safeSessionHistory,
         systemLog: loaded.systemLog || base.systemLog,
@@ -441,15 +443,22 @@ export const useStore = create((set, get) => ({
         try {
             const gw = await ensureGatewayConfigHydrated();
             if (isGatewayEnabled(gw)) {
+                const requestOptions = { timeoutMs: 3000 };
                 const record = next.gatewayRunId
-                    ? await getGatewayRun(next.gatewayRunId)
-                    : (await listGatewayRuns()).sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
+                    ? await getGatewayRun(next.gatewayRunId, requestOptions)
+                    : (await listGatewayRuns(requestOptions))
+                        .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
                 if (record) {
                     aligned = alignStateWithGatewayRun(next, record);
                 }
             }
         } catch (_) { /* Gateway 不可达时保持本地状态 */ }
 
+        // Gateway 对账也是异步窗口；用户在此期间的操作不得被旧快照覆盖。
+        if (mutationVersion !== hydrateToken) {
+            set({ hasHydrated: true });
+            return;
+        }
         const hydrated = { ...aligned, hasHydrated: true };
         saveState(hydrated);
         set(hydrated);

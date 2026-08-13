@@ -30,10 +30,10 @@ export function buildConfigRecoveryFailureMessage(timestamp = new Date().toISOSt
     };
 }
 
-export function canSubmitObjective({ objective, systemStatus }) {
+export function canSubmitObjective({ objective, systemStatus, ceoHasModel = true }) {
     const normalizedObjective = objective.trim();
-    const blockedStatuses = new Set(['running', 'waiting_for_config', 'waiting_for_human', 'paused']);
-    return !!normalizedObjective && !blockedStatuses.has(systemStatus);
+    const blockedStatuses = new Set(['running', 'waiting_for_config', 'waiting_for_human', 'waiting_for_decision', 'paused']);
+    return !!normalizedObjective && !blockedStatuses.has(systemStatus) && ceoHasModel !== false;
 }
 
 export function restoreConfigCheckpoint({
@@ -75,7 +75,10 @@ export function submitObjectiveCommand({
     replaceRunnerImpl,
 }) {
     const normalizedObjective = objective.trim();
-    if (!canSubmitObjective({ objective: normalizedObjective, systemStatus })) {
+    const agents = getSnapshot?.()?.agents;
+    const ceoHasModel = !Array.isArray(agents) || agents.length === 0
+        || agents.some(agent => agent.name === 'CEO' && !!agent.model);
+    if (!canSubmitObjective({ objective: normalizedObjective, systemStatus, ceoHasModel })) {
         return { status: 'noop' };
     }
 

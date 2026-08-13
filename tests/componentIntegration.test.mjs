@@ -18,6 +18,11 @@ test('commandInputLogic updates the real store when chairman publishes a new obj
     const { submitObjectiveCommand } = await importFreshFromRoot('src/components/commandInputLogic.js');
 
     await settleAsync();
+    const ceo = useStore.getState().agents.find(agent => agent.name === 'CEO');
+    useStore.getState().dispatch({
+        type: 'UPDATE_AGENT',
+        payload: { id: ceo.id, model: 'gpt-test' },
+    });
 
     let startedObjective = null;
     const result = submitObjectiveCommand({
@@ -224,4 +229,39 @@ test('modelConfigPanelActions persist fetched provider models back into cache an
         models: [],
         error: 'network down',
     });
+});
+
+test('Gateway manual model keeps an explicit known-provider mapping', { concurrency: false }, async () => {
+    const { useStore } = await importFreshFromRoot('src/store/store.js');
+    const modelConfig = await importFreshFromRoot('src/engine/modelConfig.js');
+    const { integrateManualProviderModel } = await importFreshFromRoot('src/components/modelConfigPanelActions.js');
+    await settleAsync();
+
+    const previous = {};
+    const next = integrateManualProviderModel({
+        providerId: 'anthropic',
+        modelId: '  claude-explicit-test  ',
+        previousFetchResults: previous,
+        dispatch: useStore.getState().dispatch,
+        saveModelsCacheImpl: modelConfig.saveModelsCache,
+    });
+    const rejected = integrateManualProviderModel({
+        providerId: 'custom',
+        modelId: 'must-not-route',
+        previousFetchResults: next,
+        dispatch: () => {
+            throw new Error('unknown provider must not dispatch');
+        },
+        saveModelsCacheImpl: () => {
+            throw new Error('unknown provider must not persist');
+        },
+    });
+
+    assert.deepEqual(next.anthropic.models, [{
+        id: 'claude-explicit-test',
+        name: 'claude-explicit-test',
+        provider: 'anthropic',
+    }]);
+    assert.deepEqual(useStore.getState().availableModels.anthropic, next.anthropic.models);
+    assert.equal(rejected, next);
 });

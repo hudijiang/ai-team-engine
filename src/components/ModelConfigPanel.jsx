@@ -18,12 +18,16 @@ import {
 import {
     hydrateModelConfigPanelState,
     integrateFetchedProviderModels,
+    integrateManualProviderModel,
     integrateProviderFetchError,
 } from './modelConfigPanelActions.js';
 import {
     ensureGatewayConfigHydrated,
+    isGatewayEnabled,
     saveGatewayConfig,
 } from '../engine/gatewayConfig.js';
+import { listGatewayModels, listGatewayProviders } from '../engine/gatewayRuns.js';
+import { getKnownProvider } from '../engine/providerCatalog.js';
 
 /**
  * 模型配置面板
@@ -40,6 +44,8 @@ export default function ModelConfigPanel() {
     const latestConfigsRef = useRef({});
     const lastConfigMutationAtRef = useRef(0);
     const [gateway, setGateway] = useState({ useGateway: false, gatewayUrl: '', accessToken: '' });
+    const [gatewayProviders, setGatewayProviders] = useState([]);
+    const [manualModelIds, setManualModelIds] = useState({});
     const gatewayTimerRef = useRef(null);
 
     // 初始化：加载 API 配置 + 恢复模型缓存
@@ -82,6 +88,24 @@ export default function ModelConfigPanel() {
         };
     }, [dispatch]);
 
+    // 直接使用组件内配置探测服务端，避免首次配置受持久化防抖影响。
+    useEffect(() => {
+        if (!isGatewayEnabled(gateway)) {
+            setGatewayProviders([]);
+            return undefined;
+        }
+        let active = true;
+        const timer = setTimeout(() => {
+            void listGatewayProviders(gateway).then(rows => {
+                if (active) setGatewayProviders(rows);
+            });
+        }, 250);
+        return () => {
+            active = false;
+            clearTimeout(timer);
+        };
+    }, [gateway.useGateway, gateway.gatewayUrl, gateway.accessToken]);
+
     // 修改配置后自动保存（防抖 500ms）
     const updateConfig = useCallback((providerId, field, value) => {
         lastConfigMutationAtRef.current = Date.now();
@@ -99,15 +123,16 @@ export default function ModelConfigPanel() {
 
     // 拉取某供应商的模型列表
     const handleFetchModels = useCallback(async (providerId) => {
+        const gatewayOn = isGatewayEnabled(gateway);
         const config = configs[providerId];
-        if (!canFetchProviderModels(config)) return;
-
-        // 先保存当前配置确保最新
-        saveProviderConfigs(configs);
+        if (!gatewayOn && !canFetchProviderModels(config)) return;
+        if (!gatewayOn) saveProviderConfigs(configs);
 
         setFetchingModels(providerId);
         try {
-            const models = await fetchModelsFromAPI(config.apiUrl, config.apiKey, providerId);
+            const models = gatewayOn
+                ? await listGatewayModels(providerId, gateway)
+                : await fetchModelsFromAPI(config.apiUrl, config.apiKey, providerId);
             setFetchResults(prev => {
                 return integrateFetchedProviderModels({
                     providerId,
@@ -126,7 +151,20 @@ export default function ModelConfigPanel() {
         } finally {
             setFetchingModels(null);
         }
-    }, [configs, dispatch]);
+    }, [configs, dispatch, gateway.useGateway, gateway.gatewayUrl, gateway.accessToken]);
+
+    const handleAddManualModel = useCallback((providerId) => {
+        const modelId = String(manualModelIds[providerId] || '').trim();
+        if (!modelId || !getKnownProvider(providerId)) return;
+        setFetchResults(prev => integrateManualProviderModel({
+            providerId,
+            modelId,
+            previousFetchResults: prev,
+            dispatch,
+            saveModelsCacheImpl: saveModelsCache,
+        }));
+        setManualModelIds(prev => ({ ...prev, [providerId]: '' }));
+    }, [dispatch, manualModelIds]);
 
     const toggleExpand = (id) => {
         setExpandedProvider(prev => prev === id ? null : id);
@@ -138,29 +176,37 @@ export default function ModelConfigPanel() {
                 <div>
                     <div className="model-config-panel__title">⚙️ 供应商 API 配置</div>
                     <div className="model-config-panel__desc">
-                        配置供应商 API 后，点击「获取模型」拉取可用模型列表。然后在左侧 Agent 卡片中为每个 Agent 选择模型。
+                        直连模式需配置供应商 Key。Gateway 模式只需填写模型 ID，由本机 Gateway 持有供应商密钥。
                     </div>
                 </div>
                 <span className="model-config-panel__autosave">🔄 自动保存</span>
             </div>
 
             {PROVIDERS.map(provider => {
+                const gatewayOn = isGatewayEnabled(gateway);
                 const config = configs[provider.id] || { apiUrl: '', apiKey: '' };
                 const isExpanded = expandedProvider === provider.id;
                 const isConfigured = !!(config.apiUrl && config.apiKey);
+                const knownGatewayProvider = getKnownProvider(provider.id);
+                const gatewayProviderState = gatewayProviders.find(item => item.id === provider.id);
+                const gatewayConfigured = gatewayProviderState?.configured === true;
                 const result = fetchResults[provider.id];
                 const isFetching = fetchingModels === provider.id;
 
                 return (
                     <div
                         key={provider.id}
-                        className={`model-config-item ${isConfigured ? 'model-config-item--configured' : ''}`}
+                        className={`model-config-item ${(isConfigured || gatewayConfigured) ? 'model-config-item--configured' : ''}`}
                     >
                         <div className="model-config-item__header" onClick={() => toggleExpand(provider.id)}>
                             <div className="model-config-item__name">
                                 <span className="model-config-item__icon">{provider.icon}</span>
                                 {provider.name}
-                                {isConfigured && <span className="model-config-item__badge">已配置</span>}
+                                {!gatewayOn && isConfigured && <span className="model-config-item__badge">已配置</span>}
+                                {gatewayOn && gatewayConfigured && <span className="model-config-item__badge">Gateway 已配置</span>}
+                                {gatewayOn && !knownGatewayProvider && (
+                                    <span className="model-config-item__badge" style={{ opacity: 0.65 }}>Gateway 不支持</span>
+                                )}
                                 {result?.models?.length > 0 && (
                                     <span className="model-config-item__badge" style={{ background: 'rgba(59,130,246,0.15)', color: 'var(--accent-blue)' }}>
                                         {result.models.length} 个模型
@@ -172,35 +218,63 @@ export default function ModelConfigPanel() {
 
                         {isExpanded && (
                             <div className="model-config-item__body">
-                                <div className="model-config-item__field">
-                                    <label className="model-config-item__label">API URL</label>
-                                    <input
-                                        className="model-config-item__input"
-                                        type="text"
-                                        value={config.apiUrl || ''}
-                                        onChange={e => updateConfig(provider.id, 'apiUrl', e.target.value)}
-                                        placeholder={provider.defaultApiUrl || 'https://api.example.com/v1'}
-                                        id={`api-url-${provider.id}`}
-                                    />
-                                </div>
-                                <div className="model-config-item__field">
-                                    <label className="model-config-item__label">API Key</label>
-                                    <input
-                                        className="model-config-item__input"
-                                        type="password"
-                                        value={config.apiKey || ''}
-                                        onChange={e => updateConfig(provider.id, 'apiKey', e.target.value)}
-                                        placeholder={provider.placeholder}
-                                        id={`api-key-${provider.id}`}
-                                    />
-                                </div>
+                                {!gatewayOn && (
+                                    <>
+                                        <div className="model-config-item__field">
+                                            <label className="model-config-item__label">API URL</label>
+                                            <input
+                                                className="model-config-item__input"
+                                                type="text"
+                                                value={config.apiUrl || ''}
+                                                onChange={event => updateConfig(provider.id, 'apiUrl', event.target.value)}
+                                                placeholder={provider.defaultApiUrl || 'https://api.example.com/v1'}
+                                                id={`api-url-${provider.id}`}
+                                            />
+                                        </div>
+                                        <div className="model-config-item__field">
+                                            <label className="model-config-item__label">API Key</label>
+                                            <input
+                                                className="model-config-item__input"
+                                                type="password"
+                                                value={config.apiKey || ''}
+                                                onChange={event => updateConfig(provider.id, 'apiKey', event.target.value)}
+                                                placeholder={provider.placeholder}
+                                                id={`api-key-${provider.id}`}
+                                            />
+                                        </div>
+                                    </>
+                                )}
+                                {gatewayOn && knownGatewayProvider && (
+                                    <div className="model-config-item__field">
+                                        <label className="model-config-item__label">手工添加模型 ID（无需浏览器供应商 Key）</label>
+                                        <div className="model-config-item__actions">
+                                            <input
+                                                className="model-config-item__input"
+                                                value={manualModelIds[provider.id] || ''}
+                                                onChange={event => setManualModelIds(prev => ({
+                                                    ...prev,
+                                                    [provider.id]: event.target.value,
+                                                }))}
+                                                placeholder={`例如 ${provider.id === 'anthropic' ? 'claude-...' : '模型 ID'}`}
+                                                id={`gateway-model-id-${provider.id}`}
+                                            />
+                                            <button
+                                                className="model-config-item__fetch"
+                                                onClick={() => handleAddManualModel(provider.id)}
+                                                disabled={!String(manualModelIds[provider.id] || '').trim()}
+                                            >
+                                                添加
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
                                 <div className="model-config-item__actions">
                                     <button
                                         className="model-config-item__fetch"
                                         onClick={() => handleFetchModels(provider.id)}
-                                        disabled={!isConfigured || isFetching}
+                                        disabled={isFetching || (gatewayOn ? !knownGatewayProvider : !isConfigured)}
                                     >
-                                        {isFetching ? '⏳ 获取中...' : '🔄 获取模型'}
+                                        {isFetching ? '⏳ 获取中...' : gatewayOn ? '🔄 从 Gateway 获取模型' : '🔄 获取模型'}
                                     </button>
                                 </div>
 
